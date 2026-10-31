@@ -10,7 +10,8 @@ Where the port stands, and what is known not to be proven yet. How to build: [BU
   * the ARM64, Android and Vulkan work of [Skate1Native](https://github.com/Kurtisone/Skate1Native), merged with
     `sdk-patches/0001` to `0021`;
   * the renderer fixes that existed only on D3D12, ported to the SPIR-V translator (below);
-  * the Android app folder's name as a build setting.
+  * the Android app folder's name as a build setting, and `generated/rexglue.cmake` keeping the underscores of a
+    project's name (the games' names have one; Skate's has none).
 * **Renderer**: the SDK's Vulkan backend, `render_target_path_vulkan` as in each game's `port_defaults.cpp`.
 * **Linux**: the launcher and the three games in one folder, built in a container so that it runs on the Steam Deck.
 * **Android**: one APK per game. The launcher stays a desktop program.
@@ -39,18 +40,34 @@ change that conflicts with the Android work. Look there first if Trials HD is to
 ## What has been checked
 
 * The SDK builds for Linux x86-64 and Android arm64.
-* Skate runs on it on Linux (Vulkan, AMD), from the title screen to riding in game, with a new shader cache: same picture
-  as before. Vulkan's validation layer reports nothing from start to title screen.
-* All the games' own code compiles for both platforms, against stand-in headers for the generated code.
-* The launcher runs on Linux. An APK is packaged, signed and read back (without the game's libraries).
+* **Trials Fusion** (the only package tried so far) goes through `build-linux.sh` from its package to a Linux binary, and
+  runs on an AMD GPU: title screen, menus and the first track, riding included. Textures, shadows and the HUD are there.
+  The integer fetch and resolve ports are needed and work: with either one switched off, surfaces lose their textures.
+* Skate runs on the same SDK with the same picture as before.
+* All three games' own code compiles for both platforms.
+* The launcher runs on Linux. An APK is packaged, signed and read back (without a game's libraries).
 
 ## What has not
 
-**No Trials game has run on this port**: the packages were not available when it was written. So not proven:
+* Trials HD and Trials Evolution have not been built.
+* Nothing has run on an Android device, and no APK has been built with a game in it.
+* Starting a game from the launcher, and installing a package with it. Sound (the test machine has no audio).
+* Scores above 720p: all of the above is at 720p.
 
-* code generation and linking with this SDK, on any of the three games;
-* every Vulkan fix in the table above: Skate exercises the translator, not these formats;
-* `trials_extract` and the package search in `build-linux.sh`, which have only met files that are not packages.
+## Known bug: Trials Fusion's picture is green
+
+In tracks everything leans green (beige turns olive, the sky cyan); menus are fine. Same picture with `fbo` and `fsi`.
+
+The last step of the frame looks the colour up in a 32x32x16 table indexed by chromaticity and luminance. The game draws
+that table every so often from a 16x16x16 colour grade (pixel shader `3EBCA95DEB27B0CD`; the final pass is
+`BD6D432E414F4E49`). Bypassing the read of the grade in that shader makes the picture nearly neutral, so the fault is in
+what that pass feeds the grade, or in the grade's result. The grade's blue is steep (about 36 at Z 4, 155 at Z 8, 255 at Z
+12), so inputs a little too low drop the blue and look like this.
+
+Ruled out, each by a run: the 8 bit integer scale, integer fetches, the exponent bias word, the stock resolve shaders,
+`readback_resolve = full`, the 3D-as-2D wrappers, the 3D texture's load and sampling (fixed lookups at Z 0 and Z 8 give the
+table's colours), the pixel position and `log` / `exp` (same as DXBC, by reading). Next: compare that pass's float
+constants with a Windows run; c251 to c255 hold its matrix and gamma.
 
 ## Expected trouble
 

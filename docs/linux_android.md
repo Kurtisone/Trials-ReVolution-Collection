@@ -45,12 +45,12 @@ change that conflicts with the Android work. Look there first if Trials HD is to
   The integer fetch and resolve ports are needed and work: with either one switched off, surfaces lose their textures.
 * Skate runs on the same SDK with the same picture as before.
 * All three games' own code compiles for both platforms.
-* The launcher runs on Linux. An APK is packaged, signed and read back (without a game's libraries).
+* The launcher runs on Linux. Trials Fusion builds into a signed arm64 APK.
 
 ## What has not
 
 * Trials HD and Trials Evolution have not been built.
-* Nothing has run on an Android device, and no APK has been built with a game in it.
+* Nothing has run on an Android device. Trials Fusion's APK builds and is signed, and that is all that is known of it.
 * Starting a game from the launcher, and installing a package with it. Sound (the test machine has no audio).
 * Scores above 720p: all of the above is at 720p.
 

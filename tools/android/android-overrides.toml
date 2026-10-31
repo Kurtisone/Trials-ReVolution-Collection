@@ -1,0 +1,19 @@
+# Settings every Trials game uses on Android, on top of each game's own defaults (port_defaults.cpp).
+#
+# Native 720p: 2x costs about 4x the GPU time on the Vulkan backend.
+draw_resolution_scale_x = 1
+draw_resolution_scale_y = 1
+# Play with the handheld's controller; no keyboard emulation of the pad.
+mnk_mode = false
+# Fill the screen and hide Android's status and navigation bars.
+fullscreen = true
+# FPS counter (top right).
+show_fps_counter = true
+# Tiled GPUs (Adreno): copy guest memory uploads before the render pass instead of ending it for each one.
+vulkan_hoist_shared_memory_uploads = true
+# Resolve 32-bit render targets straight from the render target instead of dumping them to the EDRAM buffer first.
+vulkan_direct_resolve_fast32 = true
+# Batch the GPU work (measured on an Adreno 740 with Skate: 68 ms down to 40-51 ms per frame).
+vulkan_submit_on_primary_buffer_end = false
+# Android reports stereo speakers as a 6-channel device; fold the guest's 5.1 to stereo with the SDK's normalized mix.
+audio_force_stereo = true

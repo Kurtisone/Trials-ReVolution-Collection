@@ -99,8 +99,9 @@ was black. `vulkan_shader_float_controls = false` fixes it. Which of the three m
 The picture on the Odin has the same green tint as on Linux (bug above).
 
 Turnip: v25.3.0-R11 and v26.0.0-R8 stay black. MrPurple T30 (26.3.0, Vulkan 1.4.359) renders, at 21 FPS on the first track
-(47 ms a frame, GPU thread 27 ms against 41 with the Qualcomm driver), so the game's side limits it there. One of its three
-runs ended before the track, with no crash report.
+(47 ms a frame). Its timestamps add up to 23 ms and its GPU thread reports 22, but both leave out binning: the thread sleeps
+36 ms a frame on the fence that limits frames in flight, so the GPU is the limit there too, as with the Qualcomm driver. Two
+of its runs ended early with no crash report.
 
 A track can be reached without touching the device: `mnk_mode = true`, `keybind_a = 'Space'`, `keybind_start = 'Return'`,
 then `adb shell input keyevent --longpress` with 66 (Return) and 62 (Space).

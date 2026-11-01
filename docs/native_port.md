@@ -1,6 +1,6 @@
 # Native renderer for Trials Fusion
 
-The aim, as in Skate1Native: no Xenos emulation, the game's D3D calls go to a native renderer. Not started in code. This is
+The aim, as in Skate1Native: no Xenos emulation. Skate takes the game's D3D calls; Fusion has to use its command stream (see below). Not started in code. This is
 what was measured on `default.xex` 0.0.0.3 before writing any.
 
 ## Shaders
@@ -80,9 +80,59 @@ engine must set them another way. `82225058`, called from the draw and holding a
 read for shaders. `8222C768` (1,689 calls a frame) and `8222C6D8` (1,637) are candidates for constants: the XDK has calls
 that give the caller a pointer straight into the command buffer, which would leave nothing in the device.
 
+## Where the time goes on the Odin 2 Portal
+
+Measured on the first track, Qualcomm driver, 23 FPS, with `vulkan_gpu_timestamp_buckets = true`.
+
+The GPU is the limit. The Adreno is 97 to 99% busy at its top clock of 680 MHz, at 43 degrees, and the Render thread spends
+85% of its time in `8225B0A0`, D3D's block on fence, waiting for it.
+
+| Bucket | ms a frame | What |
+| --- | --- | --- |
+| PassEntry | 17 | Entering 86 render passes: tile loads, and the deferred work of the pass before |
+| Main | 7 | The game's own draws |
+| TexUpload | 6.3 | Nearly all copies into images |
+| Resolves and dumps | 5.5 | |
+| RtTransfer | 4.9 | Moving EDRAM contents between render targets |
+| Other | 6 | |
+
+Each frame sends 167 render passes, 106 render target transfers, 260 dispatches, 325 barriers and 2,300 draws. The game's
+drawing is a small part of the cost. Almost all the rest is the emulation of EDRAM on a tile based GPU, which is what a native
+renderer would remove.
+
+### The frame
+
+1. 4x pass: depth at tile 0, `k_16_16` at tile 832, more than 1,000 draws, then 1x G-buffer pass, about 330 draws, on `@494` and `@988`.
+2. Five rounds of one or two 4x depth only draws that write stencil, then a 1x full screen light that reads it.
+3. Post processing, each step on EDRAM still holding another format.
+
+The surfaces are 1040 x 608 at 1x. Those labelled 4x are 520 x 304 over the same samples: the depth moves between the two
+views eight times a frame, 45% of all transfers by area.
+
+`SetVertexShader` is called only with 0 and `SetPixelShader` never on a track. The engine sends shaders and constants itself,
+constants with `SET_SHADER_CONSTANTS` (`0x56`) through `8222C6D8`. **So the device cannot describe a draw and hooks on D3D
+calls will not work for Fusion, unlike Skate.** That also explains the draw count gap above. The native renderer has to take
+its state from the command stream, where the SDK already has every register, constant and shader address.
+
+### Tried, none kept
+
+| Change | Result |
+| --- | --- |
+| Skip all transfers | 38 FPS on a broken, emptier scene, so it overstates the gain |
+| Skip transfers into depth | 33 FPS, black scene |
+| Skip colour to colour transfers | 24 FPS, wrong smoke: they are cheap |
+| Keep clean copies of depth views | No gain: the stencil rounds really write |
+| Draw depth only 4x draws into the 1x surface, viewport doubled | 2 ms, lighter walls |
+| Reload big textures once a frame | 41 ms; the rider looked wrong, not cleared up |
+| `vulkan_deferred_resolve_clears` | Nothing |
+| `vsync = false` | Nothing |
+| `readback_resolve = none` | 27 FPS, no textures |
+
+The virtual texture table (2048 x 2048, 8 MB) is reloaded whole 4 to 5 times a frame, about 73 MB, most of TexUpload.
+
 ## Order of work
 
-1. Find how constants and shaders reach the GPU: read `82225058`, `8222C768`, `8222C6D8`.
+0. Move the native renderer's entry to the command stream: take draws from the SDK's `IssueDraw`, keep the render targets simple.
 2. Shaders: the raw microcode, for the whole set, through the SDK's translator.
 3. Render the title screen from a frame capture.
 4. Memory export: the deciding step, without which tracks have no textures.

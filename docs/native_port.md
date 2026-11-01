@@ -96,9 +96,12 @@ The GPU is the limit. The Adreno is 97 to 99% busy at its top clock of 680 MHz, 
 | RtTransfer | 4.9 | Moving EDRAM contents between render targets |
 | Other | 6 | |
 
-Each frame sends 167 render passes, 106 render target transfers, 260 dispatches, 325 barriers and 2,300 draws. The game's
-drawing is a small part of the cost. Almost all the rest is the emulation of EDRAM on a tile based GPU, which is what a native
-renderer would remove.
+Each frame sends 167 render passes, 106 render target transfers, 260 dispatches, 325 barriers and 2,300 draws.
+
+PassEntry is mostly pixel shading, deferred by the tile based GPU to the end of the pass before: with every draw scissored to
+the top half of the screen it falls from 17 to 7.7 ms and the frame from 44 to 34 ms, with tile loads and stores left as
+they were. So about 24 ms of the frame is the game's own drawing, and EDRAM emulation is at most about 10 to 15 ms of the
+rest. An earlier version of this file said the emulation was nearly all of the cost; that was wrong.
 
 ### The frame
 
@@ -119,6 +122,7 @@ its state from the command stream, where the SDK already has every register, con
 | Change | Result |
 | --- | --- |
 | Skip all transfers | 38 FPS on a broken, emptier scene, so it overstates the gain |
+| The 4x as 1x test below with the screen scissor overflowing, or a draw skipped | 27 to 30 FPS: false, those draws were not rendered |
 | Skip transfers into depth | 33 FPS, black scene |
 | Skip colour to colour transfers | 24 FPS, wrong smoke: they are cheap |
 | Keep clean copies of depth views | No gain: the stencil rounds really write |
@@ -127,10 +131,25 @@ its state from the command stream, where the SDK already has every register, con
 | `vulkan_deferred_resolve_clears` | Nothing |
 | `vsync = false` | Nothing |
 | `readback_resolve = none` | 27 FPS, no textures |
+| All 4x surfaces drawn as the 1x surface of twice the size, on registers doubled per draw | 23 FPS, right picture: transfers lose 2 ms, the 4x passes now shade four times the pixels |
+| Shaders through `spirv-opt -O`, a third smaller | No change: the driver's compiler already does this |
 
 The virtual texture table (2048 x 2048, 8 MB) is reloaded whole 4 to 5 times a frame, about 73 MB, most of TexUpload.
 
-## Order of work
+## Verdict so far
+
+60 FPS on the Odin 2 Portal is out of reach by removing emulation alone. With the 44 ms split as above, a renderer with no
+EDRAM emulation at all would still spend about 24 ms on the same draws with the same shaders, about 40 FPS at the very best
+and with texture uploads and resolves still to remove. The one lever measured to work is fewer pixels: half the area takes
+10 ms off. The game renders at 1024 x 608, and where the engine sets that has not been found: no constant pair in the code.
+
+Next, in order of expected gain for the work:
+
+1. Find the engine's render resolution and lower it, aiming at a steady 30 FPS.
+2. Load the virtual texture table only where it changed, not whole 4 to 5 times a frame (4 ms).
+3. The native renderer, only if the two above fall short.
+
+Native work left, if taken up:
 
 0. Move the native renderer's entry to the command stream: take draws from the SDK's `IssueDraw`, keep the render targets simple.
 2. Shaders: the raw microcode, for the whole set, through the SDK's translator.

@@ -46,13 +46,13 @@ change that conflicts with the Android work. Look there first if Trials HD is to
 * Skate runs on the same SDK with the same picture as before.
 * All three games' own code compiles for both platforms.
 * The launcher runs on Linux. Trials Fusion builds into a signed arm64 APK.
-* That APK runs on an AYN Odin 2 Portal (Adreno 740) with the system's Qualcomm driver: picture and sound in the intro
-  movie, about 6 FPS there, held back by the game's side (175 ms a frame, GPU 19 ms).
+* That APK runs on an AYN Odin 2 Portal (Adreno 740) with the system's Qualcomm driver: picture and sound, 84 FPS on the
+  title screen.
 
 ## What has not
 
 * Trials HD and Trials Evolution have not been built.
-* On Android, anything past the intro movie: menus, tracks, the controller and the frame rate in play.
+* On Android, tracks since the uploads were fixed: the frame rate in play, and whether memory now holds.
 * Starting a game from the launcher, and installing a package with it. Sound (the test machine has no audio).
 * Scores above 720p: all of the above is at 720p.
 
@@ -79,12 +79,12 @@ is not FXAA, `present_upscale_resolution`, the asynchronous pipelines or the Adr
 
 ## Frame rate on the Odin 2 Portal
 
-With the Qualcomm driver the intro runs at 6 FPS (165 ms a frame), at 720p as at 1440p. Measured with simpleperf (the APK
-is profilable): the GPU Commands thread spends 92% of its time in the kernel, 72% of it under `vkCmdCopyBufferToImage`,
-where the driver allocates memory for each copy (`gsl_memory_alloc`, `kgsl_sharedmem_alloc`). Render and SDLThread only
-wait for it. Turnip has no such cost (that thread drops to 15%) but gives black frames. Ways out: find what Turnip does
-wrong, or extend `vulkan_storage_image_texture_loads` (scaled 32 bpp textures only so far) to the textures in question.
-Whether this costs anything outside movies has not been measured.
+The Qualcomm driver allocates kernel memory for each `vkCmdCopyBufferToImage` into a compressed image. Trials Fusion
+reloads its 2048x2048 virtual texture table all the time, with 8 mip levels, and each frame took 170 ms (5 FPS).
+`vulkan_uncompressed_textures` creates textures mutable, which turns that compression off: the title screen went to 84
+FPS (12 ms a frame). `vulkan_storage_image_texture_loads` also writes the front buffer and movie planes without a copy.
+
+Measured on the title screen only. Tracks have not been measured with this.
 
 ## Expected trouble
 

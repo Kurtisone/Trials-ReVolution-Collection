@@ -20,3 +20,8 @@ audio_force_stereo = true
 # Render every surface single-sampled. With 4x MSAA Trials Fusion's first track ran the Odin 2 Portal (8 GB) out of memory
 # and Android killed it. Applies at launch.
 gpu_force_msaa_1x = true
+# Qualcomm's driver allocates kernel memory for each copy into a compressed image: 170 ms a frame in Trials Fusion, which
+# reloads its virtual texture table (2048x2048, 8 levels) all the time. Uncompressed textures took it from 5 to 84 FPS.
+vulkan_uncompressed_textures = true
+# The textures reloaded every frame (the front buffer, movie planes) are written without a copy at all.
+vulkan_storage_image_texture_loads = true

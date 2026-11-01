@@ -9,6 +9,18 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
+@@ -1357,10 +1357,10 @@
+             vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
+         }
+ 
++        out += "\tin uint iVertexId : SV_VertexID,\n";
+     #ifdef UNLEASHED_RECOMP
+         if (hasIndexCount)
+         {
+-            out += "\tin uint iVertexId : SV_VertexID,\n";
+             out += "\tin uint iInstanceId : SV_InstanceID,\n";
+         }
+     #endif
 @@ -1439,6 +1439,15 @@
  
      bool printedRegisters[32]{};
@@ -25,3 +37,19 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
+@@ -1485,12 +1494,11 @@
+             {
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
+-        #ifdef UNLEASHED_RECOMP
+-            else if (!isPixelShader && hasIndexCount && i == 0)
++            else if (!isPixelShader && i == 0)
+             {
+-                out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
++                // The vertex index, which shaders use directly.
++                out += "float4(iVertexId, 0.0, 0.0, 0.0);\n";
+             }
+-        #endif
+             else
+             {
+                 out += "0.0;\n";

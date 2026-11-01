@@ -140,6 +140,8 @@ RenderFormat VertexFormat(const xenos::VertexFetchInstruction& fetch, uint32_t u
       // Integer components feed float4 inputs as their values (scaled).
       return i ? (s ? RenderFormat::R8G8B8A8_SSCALED : RenderFormat::R8G8B8A8_USCALED)
                : (s ? RenderFormat::R8G8B8A8_SNORM : RenderFormat::R8G8B8A8_UNORM);
+    case k_2_10_10_10:
+      return s ? RenderFormat::A2B10G10R10_SNORM : RenderFormat::A2B10G10R10_UNORM;
     case k_16_16:
       return i ? (s ? RenderFormat::R16G16_SSCALED : RenderFormat::R16G16_USCALED)
                : (s ? RenderFormat::R16G16_SNORM : RenderFormat::R16G16_UNORM);
@@ -176,6 +178,12 @@ RenderFormat TextureFormat(const xenos::TextureFetch& t) {
     case kTex_16_16_FLOAT: return RenderFormat::R16G16_FLOAT;
     case kTex_16_16_16_16_FLOAT: return RenderFormat::R16G16B16A16_FLOAT;
     case kTex_32_FLOAT: return RenderFormat::R32_FLOAT;
+    case kTex_1_5_5_5: return RenderFormat::A1R5G5B5_UNORM;
+    case kTex_16: return s ? RenderFormat::R16_SNORM : RenderFormat::R16_UNORM;
+    case kTex_16_FLOAT: return RenderFormat::R16_FLOAT;
+    case kTex_24_8: case kTex_24_8_FLOAT: return RenderFormat::R8G8B8A8_UNORM;
+    case kTex_DXT5A: return RenderFormat::BC4_UNORM;
+    case kTex_DXN: return s ? RenderFormat::BC5_SNORM : RenderFormat::BC5_UNORM;
     default: return RenderFormat::UNKNOWN;
   }
 }
@@ -361,6 +369,30 @@ void Renderer::WaitFrame(Frame& frame) {
   timings_.gpu_wait_ms +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
   frame.pending = false;
+  for (Frame::ReadBack& entry : frame.read_backs) {
+    // Into guest memory as a resolve lays it out: tiled, in the guest's byte order.
+    const uint8_t* data = static_cast<const uint8_t*>(entry.buffer->map());
+    const uint32_t bytes = entry.target.bytes;
+    uint32_t log2 = 0;
+    while ((1u << log2) < bytes) ++log2;
+    auto* guest = const_cast<uint8_t*>(physical_) + entry.address;
+    const uint32_t pitch = std::max(entry.target.pitch, entry.width);
+    uint8_t texel[8];
+    for (uint32_t y = 0; y < entry.height; ++y) {
+      for (uint32_t x = 0; x < entry.width; ++x) {
+        std::memcpy(texel, data + (size_t(y) * entry.width + x) * entry.host_bytes,
+                    std::min(bytes, entry.host_bytes));
+        xenos::SwapEndian(texel, bytes, entry.target.endian);
+        std::memcpy(guest + xenos::TiledOffset2D(int32_t(x), int32_t(y), pitch, log2), texel, bytes);
+      }
+    }
+    entry.buffer->unmap();
+    auto it = resolved_.find(entry.address);
+    if (watcher_ && it != resolved_.end()) {
+      it->second.watch_stamp = watcher_->Watch(entry.address, uint32_t(size_t(entry.height) * pitch * bytes));
+    }
+  }
+  frame.read_backs.clear();
   frame.retired_framebuffers.clear();
   frame.retired_buffers.clear();
   frame.retired_views.clear();
@@ -414,10 +446,22 @@ void Renderer::Transition(RenderTexture* texture, RenderTextureLayout layout) {
   commands_->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY, nullptr, 0, &barrier, 1);
 }
 
-void Renderer::SetTargets(RenderTexture* color, RenderTexture* depth) {
+void Renderer::SetTargets(RenderTexture* color, RenderTexture* depth, RenderTexture* color1) {
   Transition(color, RenderTextureLayout::COLOR_WRITE);
+  if (color1) Transition(color1, RenderTextureLayout::COLOR_WRITE);
   if (depth) Transition(depth, RenderTextureLayout::DEPTH_WRITE);
-  if (current_targets_ == std::make_pair(color, depth)) return;
+  if (current_targets_ == std::make_pair(color, depth) && current_color1_ == color1) return;
+  current_color1_ = color1;
+  if (color1) {
+    auto& pair = mrt_framebuffers_[{color, color1, depth}];
+    if (!pair) {
+      const RenderTexture* attachments[] = {color, color1};
+      pair = device_->createFramebuffer(RenderFramebufferDesc(attachments, 2, depth));
+    }
+    commands_->setFramebuffer(pair.get());
+    current_targets_ = {color, depth};
+    return;
+  }
   auto& framebuffer = framebuffers_[{color, depth}];
   if (!framebuffer) {
     const RenderTexture* attachments[] = {color};
@@ -455,7 +499,7 @@ void Renderer::BeginFrame() {
   commands_ = frame.commands.get();
   UseUploadBuffer(frame.upload.get(), kUploadSize);
   commands_->begin();
-  current_targets_ = {};
+  current_targets_ = {}; current_color1_ = nullptr;
   main_layout_bound_ = false;
 }
 
@@ -552,6 +596,31 @@ void Renderer::EndFrame(uint32_t present_address) {
                            static_cast<VulkanBuffer*>(frame.present_readback.get())->vk, 1, &region);
     frame.present_ready = true;
   }
+  for (const auto& [address, target] : read_back_) {
+    auto it = resolved_.find(address);
+    if (it == resolved_.end() || !it->second.texture) continue;
+    Texture& texture = it->second;
+    Frame::ReadBack entry;
+    entry.address = address;
+    entry.width = texture.width;
+    entry.height = texture.height;
+    entry.host_bytes = RenderFormatSize(texture.format);
+    entry.target = target;
+    entry.buffer = device_->createBuffer(
+        RenderBufferDesc::ReadbackBuffer(uint64_t(entry.width) * entry.height * entry.host_bytes));
+    Transition(texture.texture.get(), RenderTextureLayout::COPY_SOURCE);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {entry.width, entry.height, 1};
+    vkCmdCopyImageToBuffer(static_cast<VulkanCommandList*>(commands_)->vk,
+                           static_cast<VulkanTexture*>(texture.texture.get())->vk,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           static_cast<VulkanBuffer*>(entry.buffer.get())->vk, 1, &region);
+    Transition(texture.texture.get(), RenderTextureLayout::SHADER_READ);
+    frame.read_backs.push_back(std::move(entry));
+  }
+  read_back_.clear();
   commands_->end();
   const RenderCommandList* lists[] = {commands_};
   const auto submit_start = std::chrono::steady_clock::now();
@@ -900,7 +969,7 @@ Renderer::Texture* Renderer::GetGuestTexture(const xenos::TextureFetch& t) {
     if (inserted) ++stats_["textures (3D)"];
     return &guest;
   }
-  if ((t.dimension != 1 && t.dimension != 3) || format == RenderFormat::UNKNOWN) {
+  if (t.dimension > 3 || t.dimension == 2 || format == RenderFormat::UNKNOWN) {
     ++stats_["texture skipped: dimension " + std::to_string(t.dimension) + " format " +
              std::to_string(t.format)];
     return nullptr;
@@ -1017,6 +1086,21 @@ Renderer::Texture& Renderer::GetColorSurface(const xenos::DeviceState& state) {
   return *last_color_;
 }
 
+Renderer::Texture& Renderer::GetColor1Surface(const xenos::DeviceState& state) {
+  const uint32_t surface = state.Reg(xenos::reg::RB_SURFACE_INFO);
+  const uint32_t color = state.Reg(0x2003);  // RB_COLOR1_INFO
+  const uint32_t pitch = std::max(surface & 0x3FFF, 1u);
+  const uint32_t format = (color >> 16) & 0xF;
+  const float scale = SurfaceScale(pitch);
+  const uint64_t key = uint64_t(color & 0xFFF) | uint64_t(format) << 12 | uint64_t(pitch) << 16 |
+                       uint64_t(scale * 4.0f) << 40 | uint64_t(SurfaceWide(pitch) * 16.0f) << 48;
+  Texture& target = CreateSurface(key, uint32_t(pitch * scale * SurfaceWide(pitch)),
+                                  uint32_t(kMaxSurfaceHeight * scale), SurfaceFormat(format), false);
+  target.scale = scale;
+  target.scale_x = scale * SurfaceWide(pitch);
+  return target;
+}
+
 Renderer::Texture& Renderer::GetDepthSurface(const xenos::DeviceState& state) {
   const uint32_t surface = state.Reg(xenos::reg::RB_SURFACE_INFO);
   const uint32_t depth = state.Reg(xenos::reg::RB_DEPTH_INFO);
@@ -1127,7 +1211,7 @@ void Renderer::RetireResolved(Texture& dest) {
       ++it;
     }
   }
-  if (current_targets_.first == dest.texture.get()) current_targets_ = {};
+  if (current_targets_.first == dest.texture.get()) current_targets_ = {}; current_color1_ = nullptr;
   layouts_.erase(dest.texture.get());
   retired_textures_.push_back(std::move(dest.texture));
   retired_views_.push_back(std::move(dest.view));
@@ -1222,6 +1306,41 @@ void Renderer::Resolve(const ResolveCall& call) {
   commands_->drawInstanced(3, 1, 0, 0);
   Transition(dest.texture.get(), RenderTextureLayout::SHADER_READ);
   ++stats_[depth ? "resolves (depth)" : "resolves (color)"];
+  if (call.trace_index) {
+    TraceDump dump;
+    dump.index = call.trace_index;
+    dump.address = address;
+    dump.width = dest.width;
+    dump.height = dest.height;
+    dump.format = uint32_t(dest.format);
+    dump.bytes = RenderFormatSize(dest.format);
+    dump.buffer = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(dest.width) * dest.height * dump.bytes));
+    Transition(dest.texture.get(), RenderTextureLayout::COPY_SOURCE);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {dest.width, dest.height, 1};
+    vkCmdCopyImageToBuffer(static_cast<VulkanCommandList*>(commands_)->vk, static_cast<VulkanTexture*>(dest.texture.get())->vk,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VulkanBuffer*>(dump.buffer.get())->vk, 1, &region);
+    Transition(dest.texture.get(), RenderTextureLayout::SHADER_READ);
+    trace_dumps_.push_back(std::move(dump));
+  }
+  // The game reads small resolves on the CPU: exposure, the page requests of
+  // the virtual textures.
+  {
+    const uint32_t info = call.state.Reg(0x231B);
+    const uint32_t guestFormat = (info >> 7) & 0x3F;
+    uint32_t guestBytes = 0;
+    switch (guestFormat) {
+      case 24: case 30: guestBytes = 2; break;
+      case 6: case 7: case 25: case 31: case 36: guestBytes = 4; break;
+      case 26: case 32: guestBytes = 8; break;
+      default: break;
+    }
+    if (guestBytes && !depth && uint64_t(dest.width) * dest.height * guestBytes <= 256 * 1024) {
+      read_back_[address] = {guestBytes, destPitch, info & 7};
+    }
+  }
 
   // Clears that ride on the resolve, limited to the resolved rect (with
   // predicated tiling that is the tile; the other bands are still to resolve).
@@ -1256,10 +1375,6 @@ void Renderer::Draw(const DrawCall& call) {
     default:
       ++stats_["draw skipped: primitive " + std::to_string(call.primitive)];
       return;
-  }
-  if (quads && call.indices_size) {
-    ++stats_["draw skipped: indexed quad list"];
-    return;
   }
   Shader* vs = GetShader(call.vs_key);
   Shader* ps = GetShader(call.ps_key);
@@ -1518,7 +1633,10 @@ void Renderer::Draw(const DrawCall& call) {
   // Targets.
   Texture& color = GetColorSurface(state);
   Texture& depth = GetDepthSurface(state);
-  SetTargets(color.texture.get(), depth.texture.get());
+  const uint32_t colorMaskAll = state.Reg(xenos::reg::RB_COLOR_MASK);
+  Texture* color1 = (colorMaskAll >> 4) & 0xF ? &GetColor1Surface(state) : nullptr;
+  // Skate never writes two targets, so the last clear's surface cache stays valid.
+  SetTargets(color.texture.get(), depth.texture.get(), color1 ? color1->texture.get() : nullptr);
   SetMainLayout();
 
   // Pipeline.
@@ -1561,6 +1679,12 @@ void Renderer::Draw(const DrawCall& call) {
   }
   desc.renderTargetFormat[0] = color.format;
   desc.renderTargetCount = 1;
+  if (color1) {
+    desc.renderTargetFormat[1] = color1->format;
+    desc.renderTargetCount = 2;
+    desc.renderTargetBlend[1] = RenderBlendDesc::Copy();
+    desc.renderTargetBlend[1].renderTargetWriteMask = uint8_t((colorMaskAll >> 4) & 0xF);
+  }
   desc.depthTargetFormat = depth.format;
   RenderBlendDesc& blend = desc.renderTargetBlend[0];
   blend.srcBlend = BlendFactor(blendControl & 0x1F);
@@ -1724,7 +1848,26 @@ void Renderer::Draw(const DrawCall& call) {
   }
   commands_->setGraphicsPushConstants(0, pushConstants);
   commands_->setVertexBuffers(0, vertexViews.data(), uint32_t(vertexViews.size()), inputSlots.data());
-  if (call.indices_size) {
+  if (call.indices_size && quads) {
+    // Each four indices make two triangles.
+    std::vector<uint8_t> guest(call.indices_size);
+    std::memcpy(guest.data(), physical_ + (call.indices_address & 0x1FFFFFFF), guest.size());
+    xenos::SwapEndian(guest.data(), guest.size(), call.indices_endian);
+    const uint32_t bytes = call.indices_32bit ? 4 : 2;
+    const uint32_t quadCount = std::min<uint32_t>(call.count, uint32_t(guest.size() / bytes)) / 4;
+    std::vector<uint8_t> indices(size_t(quadCount) * 6 * bytes);
+    for (uint32_t q = 0; q < quadCount; ++q) {
+      static constexpr uint8_t kTriangles[] = {0, 1, 2, 0, 2, 3};
+      for (uint32_t i = 0; i < 6; ++i) {
+        std::memcpy(&indices[(q * 6 + i) * bytes], &guest[(q * 4 + kTriangles[i]) * bytes], bytes);
+      }
+    }
+    const uint64_t at = Allocate(indices.data(), indices.size(), 16);
+    RenderIndexBufferView view{upload_->at(at), uint32_t(indices.size()),
+                               call.indices_32bit ? RenderFormat::R32_UINT : RenderFormat::R16_UINT};
+    commands_->setIndexBuffer(&view);
+    commands_->drawIndexedInstanced(quadCount * 6, 1, 0, int32_t(call.base_vertex), 0);
+  } else if (call.indices_size) {
     const auto fill = [&](uint8_t* data) { xenos::SwapEndian(data, call.indices_size, call.indices_endian); };
     const RenderBuffer* buffer =
         GetGuestBuffer(call.indices_address, call.indices_size, call.indices_32bit ? 2 : 1, std::ref(fill));
@@ -1749,16 +1892,16 @@ void Renderer::Draw(const DrawCall& call) {
   ++stats_["draws"];
 }
 
-bool Renderer::ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) {
+bool Renderer::ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height,
+                            uint32_t* format_out) {
   auto it = resolved_.find(address & 0xFFFFF000);
-  if (it == resolved_.end() || (it->second.format != RenderFormat::R8G8B8A8_UNORM &&
-                                it->second.format != RenderFormat::R16G16_UNORM)) {
-    return false;
-  }
+  if (it == resolved_.end()) return false;
   Texture& texture = it->second;
   width = texture.width;
   height = texture.height;
-  auto readback = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(width) * height * 4));
+  const uint32_t texelBytes = RenderFormatSize(texture.format);
+  if (format_out) *format_out = uint32_t(texture.format);
+  auto readback = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(width) * height * texelBytes));
   WaitIdle();
   Frame& frame = frames_[frame_];
   commands_ = frame.commands.get();
@@ -1781,9 +1924,22 @@ bool Renderer::ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32
   queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
   queue_->waitForCommandFence(frame.fence.get());
   const uint8_t* data = static_cast<const uint8_t*>(readback->map());
-  rgba.assign(data, data + size_t(width) * height * 4);
+  rgba.assign(data, data + size_t(width) * height * texelBytes);
   readback->unmap();
   return true;
+}
+
+void Renderer::WriteTraceDumps(const std::string& path) {
+  for (TraceDump& dump : trace_dumps_) {
+    char name[64];
+    snprintf(name, sizeof(name), ".%03u.%08X_%ux%u_%u.raw", dump.index, dump.address, dump.width, dump.height, dump.format);
+    if (FILE* f = fopen((path + name).c_str(), "wb")) {
+      fwrite(dump.buffer->map(), 1, size_t(dump.width) * dump.height * dump.bytes, f);
+      dump.buffer->unmap();
+      fclose(f);
+    }
+  }
+  trace_dumps_.clear();
 }
 
 }  // namespace native_gpu

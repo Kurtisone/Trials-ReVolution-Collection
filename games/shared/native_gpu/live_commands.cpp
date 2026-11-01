@@ -57,6 +57,9 @@ REXCVAR_DEFINE_BOOL(native_gpu_present, true, "GPU", "Show the native renderer's
 REXCVAR_DEFINE_BOOL(native_gpu_present_early, true, "GPU",
                     "Show a frame as soon as the GPU has finished it");
 REXCVAR_DEFINE_INT32(native_gpu_stats_seconds, 5, "GPU", "Log the native renderer's rate (0 = off)");
+REXCVAR_DEFINE_STRING(native_gpu_dump_addresses, "", "GPU",
+                      "Resolved textures to write with the traced frame, comma separated hexadecimal");
+REXCVAR_DEFINE_INT32(native_gpu_trace_frame, 0, "GPU", "Log the commands of this frame");
 REXCVAR_DEFINE_STRING(native_gpu_dump_path, "native_frame.ppm", "GPU",
                       "Creating <path>.trigger writes the next front buffer here");
 
@@ -272,6 +275,7 @@ struct Frame {
   std::vector<uint8_t> arena;
   uint32_t front_buffer = 0;
   bool dump = false;
+  std::vector<uint32_t> dump_addresses;
 };
 Frame g_recording;
 void RenderDeferredCalls(Frame& frame) {
@@ -392,15 +396,30 @@ void RenderFrame(Frame& frame) {
   if (frame.dump) {
     g_renderer->WaitIdle();
     std::vector<uint8_t> rgba;
-    uint32_t width = 0, height = 0;
-    if (g_renderer->ReadResolved(frame.front_buffer, rgba, width, height)) {
-      WritePpm(REXCVAR_GET(native_gpu_dump_path), rgba, width, height);
-      REXLOG_INFO("native_gpu: front buffer {:08X} written to {}", frame.front_buffer,
-                  REXCVAR_GET(native_gpu_dump_path));
+    uint32_t width = 0, height = 0, format = 0;
+    std::vector<uint32_t> addresses = frame.dump_addresses;
+    addresses.push_back(frame.front_buffer);
+    {
+      const std::string list = REXCVAR_GET(native_gpu_dump_addresses);
+      for (size_t at = 0; at < list.size();) {
+        size_t used = 0;
+        addresses.push_back(uint32_t(std::stoul(list.substr(at), &used, 16)));
+        at += used + 1;
+      }
     }
-    for (const auto& [what, count] : g_renderer->stats()) {
-      REXLOG_INFO("native_gpu: {} {}", count, what);
+    for (uint32_t address : addresses) {
+      if (!g_renderer->ReadResolved(address, rgba, width, height, &format)) {
+        REXLOG_INFO("native_gpu: nothing resolved at {:08X}", address);
+        continue;
+      }
+      const std::string path = fmt::format("{}.{:08X}_{}x{}_{}.raw", REXCVAR_GET(native_gpu_dump_path), address,
+                                           width, height, format);
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(rgba.data(), 1, rgba.size(), f);
+        std::fclose(f);
+      }
     }
+    g_renderer->WriteTraceDumps(REXCVAR_GET(native_gpu_dump_path));
   }
   const auto spent = std::chrono::steady_clock::now() - start;
   g_thread_time += spent;
@@ -602,6 +621,7 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   return true;
 }
 
+uint32_t g_trace_index = 0;
 bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
   const uint32_t* regs = event.registers;
   const uint32_t control = regs[0x2318];  // RB_COPY_CONTROL
@@ -623,12 +643,18 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
   }
   const int scale = Surface4x(regs) ? 2 : 1;
   const size_t state = SnapshotState(regs);
+  // The renderer resolves RB_COLOR_INFO: put the selected target there.
+  if (!depth && source) {
+    static constexpr uint32_t kColorInfo[] = {0x2001, 0x2003, 0x2004, 0x2005};
+    PutReg(g_recording.arena.data() + state, 0x2001, regs[kColorInfo[source & 3]]);
+  }
   if (command != 3) {
     native_gpu::ResolveCall call;
     call.flags = depth ? 4 : 0;
     call.has_rect = true;
     std::copy(rect, rect + 4, call.rect);
     call.source_scale = scale;
+    call.trace_index = g_trace_index ? g_trace_index++ : 0;
     DeferredCall deferred{DeferredCall::Kind::kResolve, state, {}, {}, call};
     g_recording.calls.push_back(deferred);
   }
@@ -648,7 +674,12 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
   return true;
 }
 
+uint32_t g_frame_number = 0;
 void OnSwap(const rex::graphics::NativeCommandEvent& event) {
+  ++g_frame_number;
+  if (g_frame_number % 600 == 0 && g_renderer) {
+    for (const auto& [what, count] : g_renderer->stats()) REXLOG_INFO("native_gpu: stat {} {}", count, what);
+  }
   g_recording.front_buffer = event.front_buffer & 0x1FFFFFFF;
   static const bool registered = REXCVAR_GET(native_gpu_present) && RegisterPresenter();
   g_present = registered;
@@ -681,8 +712,57 @@ void OnSwap(const rex::graphics::NativeCommandEvent& event) {
   g_recording.arena.reserve(recorded_bytes + recorded_bytes / 4);
 }
 
+// One frame's commands in the log, for debugging: native_gpu_trace_frame = N.
+void TraceCommand(const rex::graphics::NativeCommandEvent& event, bool handled) {
+  const uint32_t* r = event.registers;
+  std::string textures;
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t* t = r + kRegFetchConstants + 6 * i;
+    if ((t[0] & 3) == 2 && t[1]) {
+      textures += fmt::format(" t{}:{:08X}f{}", i, t[1] & 0xFFFFF000, t[1] & 0x3F);
+    }
+  }
+  {
+    static std::unordered_set<uint32_t> seen;
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t* t = r + kRegFetchConstants + 6 * i;
+      const uint32_t address = t[1] & 0xFFFFF000;
+      if ((t[0] & 3) == 2 && address && seen.insert(address).second) {
+        const uint8_t* p = g_memory->TranslatePhysical(address);
+        uint32_t nonzero = 0;
+        for (uint32_t k = 0; k < 8 * 1024 * 1024; k += 4096 + 16) nonzero += p[k] != 0 || p[k + 1] != 0;
+        REXLOG_INFO("TRACETEX {:08X} fmt={} words={:08X} {:08X} {:08X} {:08X} nonzero={}/2039", address, t[1] & 0x3F, t[0], t[1], t[2], t[3], nonzero);
+      }
+    }
+  }
+  REXLOG_INFO("TRACE {} prim={} n={} idx={} vs={:016X} ps={:016X} surf={:08X} c0={:08X} c1={:08X} d={:08X} mask={:08X} mode={:X} dc={:08X} handled={}{}",
+              event.kind == rex::graphics::NativeCommandEvent::Kind::kCopy ? "COPY" : "DRAW", event.primitive,
+              event.count, event.indexed, event.vs_hash, event.ps_hash, r[0x2000], r[0x2001], r[0x2003], r[0x2002],
+              r[0x2104], r[0x2208], r[0x2200], handled, textures);
+  if (event.kind == rex::graphics::NativeCommandEvent::Kind::kCopy) {
+    REXLOG_INFO("TRACE   copy control={:08X} dest={:08X} pitch={:08X} info={:08X}", r[0x2318], r[0x2319], r[0x231A], r[0x231B]);
+  }
+}
+
 bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   using Kind = rex::graphics::NativeCommandEvent::Kind;
+  static uint32_t draws_this_frame = 0, traced = 0;
+  static bool tracing = false;
+  if (event.kind == Kind::kDraw) ++draws_this_frame;
+  if (event.kind == Kind::kSwap) {
+    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 400 && traced++ == 300;
+    draws_this_frame = 0;
+    g_trace_index = tracing ? 1 : 0;
+  }
+  if ((tracing || int32_t(g_frame_number) == REXCVAR_GET(native_gpu_trace_frame)) && event.kind != Kind::kSwap) {
+    bool handled = event.kind == Kind::kCopy ? OnCopy(event) : OnDraw(event);
+    TraceCommand(event, handled);
+    if (event.kind == Kind::kCopy && ((event.registers[0x2318] >> 20) & 3) != 3) {
+      g_recording.dump_addresses.push_back(event.registers[0x2319] & 0xFFFFF000);
+      g_recording.dump = true;
+    }
+    return handled;
+  }
   switch (event.kind) {
     case Kind::kDraw:
       return OnDraw(event);

@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +77,7 @@ struct ResolveCall {
   float clear_depth = 1.0f;  // ClearZ (f1), for flags 0x200
   // A 4x guest surface drawn at 1x: source pixels per destination pixel.
   int32_t source_scale = 1;
+  uint32_t trace_index = 0;  // debugging: nonzero keeps a copy of the result
 };
 
 // Tells the renderer when the game writes guest memory it has converted
@@ -139,11 +141,13 @@ class Renderer {
 
   // Waits for all submitted frames.
   void WaitIdle();
+  // Debugging: writes the copies traced resolves kept (path.<index>.<address>_<w>x<h>_<format>.raw).
+  void WriteTraceDumps(const std::string& path);
 
   // Reads back a resolved texture (RGBA8, or R16G16 as 4 bytes per texel) by
   // its guest address.
   bool ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32_t& width,
-                    uint32_t& height);
+                    uint32_t& height, uint32_t* format_out = nullptr);
 
   // Why draws or textures were skipped, and counts, for reports.
   const std::map<std::string, uint32_t>& stats() const { return stats_; }
@@ -205,10 +209,12 @@ class Renderer {
   float SurfaceWide(uint32_t pitch) const;
   Texture& GetColorSurface(const xenos::DeviceState& state);
   Texture& GetDepthSurface(const xenos::DeviceState& state);
+  Texture& GetColor1Surface(const xenos::DeviceState& state);
   Texture& CreateSurface(uint64_t key, uint32_t width, uint32_t height, plume::RenderFormat format,
                          bool depth);
   void Transition(plume::RenderTexture* texture, plume::RenderTextureLayout layout);
-  void SetTargets(plume::RenderTexture* color, plume::RenderTexture* depth);
+  void SetTargets(plume::RenderTexture* color, plume::RenderTexture* depth,
+                  plume::RenderTexture* color1 = nullptr);
   void SetMainLayout();
   // Records which EDRAM tiles the pass's targets write (`height` rows from the
   // top). With `check`, first clears the color target's tiles that another
@@ -233,7 +239,22 @@ class Renderer {
 
   // Frames in flight: the game's render thread records frame N while the GPU
   // runs frame N-1. Each slot owns what its commands use.
+  struct ReadBackTarget {
+    uint32_t bytes = 0, pitch = 0, endian = 0;
+  };
+  std::map<uint32_t, ReadBackTarget> read_back_;
+  struct TraceDump {
+    std::unique_ptr<plume::RenderBuffer> buffer;
+    uint32_t index = 0, address = 0, width = 0, height = 0, format = 0, bytes = 0;
+  };
+  std::vector<TraceDump> trace_dumps_;
   struct Frame {
+    struct ReadBack {
+      std::unique_ptr<plume::RenderBuffer> buffer;
+      uint32_t address = 0, width = 0, height = 0, host_bytes = 0;
+      ReadBackTarget target;
+    };
+    std::vector<ReadBack> read_backs;
     std::unique_ptr<plume::RenderCommandList> commands;
     std::unique_ptr<plume::RenderCommandFence> fence;
     std::unique_ptr<plume::RenderBuffer> upload;  // per-frame uploads
@@ -297,6 +318,9 @@ class Renderer {
   std::vector<std::unique_ptr<plume::RenderTextureView>> retired_views_;
   std::vector<std::unique_ptr<plume::RenderFramebuffer>> retired_framebuffers_;
   std::pair<plume::RenderTexture*, plume::RenderTexture*> current_targets_{};
+  plume::RenderTexture* current_color1_ = nullptr;
+  std::map<std::tuple<plume::RenderTexture*, plume::RenderTexture*, plume::RenderTexture*>,
+           std::unique_ptr<plume::RenderFramebuffer>> mrt_framebuffers_;
   // The surface that last wrote each EDRAM tile (5120 bytes). Surfaces at
   // overlapping EDRAM ranges share memory on the GPU but not here.
   std::vector<const Texture*> edram_owners_ = std::vector<const Texture*>(2048);

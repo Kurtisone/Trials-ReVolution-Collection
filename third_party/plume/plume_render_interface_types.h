@@ -167,6 +167,9 @@ namespace plume {
         R16G16_SSCALED,
         R16G16B16A16_USCALED,
         R16G16B16A16_SSCALED,
+        A1R5G5B5_UNORM,
+        A2B10G10R10_UNORM,
+        A2B10G10R10_SNORM,
         MAX
     };
 
@@ -554,6 +557,8 @@ namespace plume {
             return 8;
         case RenderFormat::R8G8B8A8_TYPELESS:
         case RenderFormat::R8G8B8A8_UNORM:
+        case RenderFormat::A2B10G10R10_UNORM:
+        case RenderFormat::A2B10G10R10_SNORM:
         case RenderFormat::R8G8B8A8_UINT:
         case RenderFormat::R8G8B8A8_SNORM:
         case RenderFormat::R8G8B8A8_SINT:
@@ -583,6 +588,7 @@ namespace plume {
         case RenderFormat::R16_FLOAT:
         case RenderFormat::D16_UNORM:
         case RenderFormat::R16_UNORM:
+        case RenderFormat::A1R5G5B5_UNORM:
         case RenderFormat::R16_UINT:
         case RenderFormat::R16_SNORM:
         case RenderFormat::R16_SINT:
@@ -672,6 +678,9 @@ namespace plume {
         case RenderFormat::R16_FLOAT:
         case RenderFormat::D16_UNORM:
         case RenderFormat::R16_UNORM:
+        case RenderFormat::A1R5G5B5_UNORM:
+        case RenderFormat::A2B10G10R10_UNORM:
+        case RenderFormat::A2B10G10R10_SNORM:
         case RenderFormat::R16_UINT:
         case RenderFormat::R16_SNORM:
         case RenderFormat::R16_SINT:

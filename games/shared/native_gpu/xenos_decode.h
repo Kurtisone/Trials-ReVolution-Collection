@@ -235,16 +235,23 @@ inline TextureFetch DecodeTextureFetch(const DeviceState& state, uint32_t slot) 
 
 enum TextureFormat : uint32_t {
   kTex_8 = 2,
+  kTex_1_5_5_5 = 3,
   kTex_8_8_8_8 = 6,
   kTex_8_8 = 10,
   kTex_DXT1 = 18,
   kTex_DXT2_3 = 19,
   kTex_DXT4_5 = 20,
+  kTex_24_8 = 22,
+  kTex_24_8_FLOAT = 23,
+  kTex_16 = 24,
   kTex_16_16 = 25,
   kTex_16_16_16_16 = 26,
+  kTex_16_FLOAT = 30,
   kTex_16_16_FLOAT = 31,
   kTex_16_16_16_16_FLOAT = 32,
   kTex_32_FLOAT = 36,
+  kTex_DXN = 49,
+  kTex_DXT5A = 59,
 };
 
 // Block size (texels) and bytes per block of a texture format, 0 bytes if
@@ -257,10 +264,12 @@ struct TextureBlock {
 inline TextureBlock GetTextureBlock(uint32_t format) {
   switch (format) {
     case kTex_8: return {1, 1};
-    case kTex_8_8: return {1, 2};
+    case kTex_8_8: case kTex_1_5_5_5: case kTex_16: case kTex_16_FLOAT: return {1, 2};
+    case kTex_24_8: case kTex_24_8_FLOAT: return {1, 4};
     case kTex_8_8_8_8: case kTex_16_16: case kTex_16_16_FLOAT: case kTex_32_FLOAT: return {1, 4};
     case kTex_16_16_16_16: case kTex_16_16_16_16_FLOAT: return {1, 8};
-    case kTex_DXT1: return {4, 8};
+    case kTex_DXT1: case kTex_DXT5A: return {4, 8};
+    case kTex_DXN: return {4, 16};
     case kTex_DXT2_3: case kTex_DXT4_5: return {4, 16};
     default: return {1, 0};
   }
@@ -433,7 +442,19 @@ inline int32_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, ui
 // 0 if unsupported (block-compressed or linear volumes).
 inline uint32_t UntileTexture3D(const uint8_t* physical, const TextureFetch& t, uint8_t* out) {
   const TextureBlock block = GetTextureBlock(t.format);
-  if (!block.bytes || block.size != 1 || !t.tiled) return 0;
+  if (!block.bytes || block.size != 1) return 0;
+  if (!t.tiled) {
+    const uint32_t row = t.width * block.bytes;
+    const uint32_t stride = ((std::max(t.pitch, t.width) + 31) & ~31u) * block.bytes;
+    const uint8_t* source = physical + (t.address & 0x1FFFFFFF);
+    for (uint32_t z = 0; z < t.depth; ++z) {
+      for (uint32_t y = 0; y < t.height; ++y) {
+        std::memcpy(out + (size_t(z) * t.height + y) * row, source + (size_t(z) * t.height + y) * stride, row);
+      }
+    }
+    SwapEndian(out, size_t(row) * t.height * t.depth, t.endian);
+    return row;
+  }
   uint32_t log2 = 0;
   while ((1u << log2) < block.bytes) ++log2;
   const uint32_t pitch = std::max(t.pitch, t.width);

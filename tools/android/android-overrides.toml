@@ -17,3 +17,6 @@ vulkan_direct_resolve_fast32 = true
 vulkan_submit_on_primary_buffer_end = false
 # Android reports stereo speakers as a 6-channel device; fold the guest's 5.1 to stereo with the SDK's normalized mix.
 audio_force_stereo = true
+# Render every surface single-sampled. With 4x MSAA Trials Fusion's first track ran the Odin 2 Portal (8 GB) out of memory
+# and Android killed it. Applies at launch.
+gpu_force_msaa_1x = true

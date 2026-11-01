@@ -1,6 +1,43 @@
---- a
-+++ b
-@@ -1191,7 +1191,7 @@
+--- a/shader_recompiler.cpp
++++ b/shader_recompiler.cpp
+@@ -225,6 +225,13 @@
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        indent();
++        println("texLod = r{}.{};", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
++        return;
++    }
++
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
+         return;
+ 
+@@ -326,6 +333,13 @@
+ 
+     out += dimension;
+ 
++    const bool explicitLod = instr.opcode == FetchOpcode::TextureFetch && instr.dimension == TextureDimension::Texture2D && instr.useRegLod;
++    const bool denormalized = instr.opcode == FetchOpcode::TextureFetch && instr.dimension == TextureDimension::Texture2D && instr.texCoordDenorm;
++    if (explicitLod)
++        out += "Lod";
++    else if (denormalized)
++        out += "Denorm";
++
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+         out += "Bicubic";
+@@ -338,6 +352,8 @@
+     {
+     case TextureDimension::Texture2D:
+         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
++        if (explicitLod)
++            print(", texLod, {}", denormalized ? "true" : "false");
+         break;
+     case TextureDimension::TextureCube:
+         out += ", cubeMapData";
+@@ -1191,7 +1207,7 @@
  
      // Registers the code reads that no constant table entry covers (EA's
      // shaders use raw registers next to named constants): plain loads.
@@ -9,7 +46,7 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
-@@ -1357,10 +1357,10 @@
+@@ -1357,10 +1373,10 @@
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
  
@@ -21,7 +58,7 @@
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
-@@ -1439,6 +1439,15 @@
+@@ -1439,6 +1455,15 @@
  
      bool printedRegisters[32]{};
  
@@ -37,7 +74,7 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
-@@ -1485,12 +1494,11 @@
+@@ -1485,12 +1510,11 @@
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
@@ -53,3 +90,37 @@
              else
              {
                  out += "0.0;\n";
+@@ -1500,6 +1524,7 @@
+ 
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
++    out += "\tfloat texLod = 0.0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
+     if (isPixelShader)
+--- a/shader_common.h
++++ b/shader_common.h
+@@ -67,6 +67,23 @@
+     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
++// A level the shader picked (setTexLOD), and texel rather than normalized coordinates.
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod, bool denormalized)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    uint width, height, levels;
++    texture.GetDimensions(uint(max(lod, 0.0)), width, height, levels);
++    float2 dimensions = float2(width, height);
++    float2 uv = denormalized ? (texCoord + offset) / dimensions : texCoord + offset / dimensions;
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], uv, lod);
++}
++
++float4 tfetch2DDenorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], (texCoord + offset) / getTexture2DDimensions(texture));
++}
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];

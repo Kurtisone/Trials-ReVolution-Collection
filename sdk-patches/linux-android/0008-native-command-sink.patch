@@ -219,7 +219,7 @@
 +      }
 +    };
 +    dump(vertex_shader, 'v');
-+    dump(pixel_shader, 'p');
++    dump(static_cast<VulkanShader*>(active_pixel_shader()), 'p');
 +  }
    bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
    if (memexport_used_pixel) {

@@ -19,20 +19,27 @@ the renderer stays close to Skate's. Draws whose shader has no native form go on
 
 Shaders: run with `gpu_shader_dump_dir`, then `tools/native/build_shaders.sh <dump>`. `make_containers.py` wraps raw microcode in
 the D3DX containers XenosRecomp reads. XenosRecomp needs `tools/native/xenosrecomp.patch`: all 256 pixel constants, loop
-counts per draw, and r0 as the vertex index, which Fusion's shaders use directly (terrain, full screen triangles).
+counts per draw, r0 as the vertex index, which Fusion's shaders use directly (terrain, full screen triangles), and `setTexLOD` with
+texel coordinates.
 
 Surfaces marked 4x are drawn at 1x with viewport and pitch doubled. Resolves of 256 KB or less go back to guest memory a frame
 or two later, for the exposure and page request readers.
 
 To see a frame: `native_gpu_trace_frame = -1` logs a track frame and `native_gpu_dump_path` writes each resolve in order.
+`native_gpu_observe = true` with `native_gpu_present = false` leaves rendering to the plugin and logs the same frame, for comparison.
+`TRACE guest` lines show guest memory at each resolve destination. Screens that go wholly black in tests are a crash or the
+display timing out: use `svc power stayon true` and look at the top activity.
 
 What is left, in order:
 
-1. Base colours. Prime suspect: the page table is written by memory export, which stays in the plugin's GPU memory.
-   `readback_memexport_fast = true` freezes on the native path; the slow path runs but did not fix the picture, and
-   whether the table reaches guest memory is unmeasured (`TRACETEX` in the trace was written for that).
+1. Base colours. The virtual texture table's mip levels (2 to 3 MB from `mip_address`) are all zero here against 92,794 non zero
+   words under emulation; its base level is empty in both. Those levels copy themselves (`6398EA`, `95BB84`, explicit level
+   fetches), so they need a seed, and `native_gpu_observe` shows it: pixel shader `BCFF66D9` with vertex shader `0B97B324`, and
+   vertex shader `DDED7E53`, 52 draws each as the table fills. All are memory export, so they run on the plugin, but with
+   `readback_memexport = true` and `readback_memexport_fast = false` the table is still zero in guest memory. Next: find out
+   whether those draws run at all on the native path and where they write, or run the export natively (`BCFF` is 42 dwords).
 2. Rect lists (primitive 8) are skipped.
-3. Frame pacing: nothing limits the rate, menus run at 700 FPS and that upsets driving the game by keys.
+3. Frame pacing: `native_gpu_frame_limit` holds 60, without a real vertical blank.
 4. Early present: races on the fence at high frame rates, off by default.
 5. Pixel position in 4x draws is not halved here as it was in the plugin test.
 6. Destination offsets of resolves in the shadow atlas, surface reinterpretation between formats.

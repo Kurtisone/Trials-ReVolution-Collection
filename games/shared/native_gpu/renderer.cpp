@@ -376,20 +376,32 @@ void Renderer::WaitFrame(Frame& frame) {
     uint32_t log2 = 0;
     while ((1u << log2) < bytes) ++log2;
     auto* guest = const_cast<uint8_t*>(physical_) + entry.address;
-    const uint32_t pitch = std::max(entry.target.pitch, entry.width);
+    const uint32_t pitch = std::max(entry.target.pitch, entry.target.x + entry.width);
     uint8_t texel[8];
     for (uint32_t y = 0; y < entry.height; ++y) {
       for (uint32_t x = 0; x < entry.width; ++x) {
-        std::memcpy(texel, data + (size_t(y) * entry.width + x) * entry.host_bytes,
-                    std::min(bytes, entry.host_bytes));
+        const uint8_t* host = data + (size_t(y) * entry.width + x) * entry.host_bytes;
+        if (entry.target.format == 2 && entry.host_bytes == 4) {
+          texel[0] = host[entry.target.swap_red_blue ? 0 : 2];
+        } else if (entry.target.format == 3 && entry.host_bytes == 4) {
+          // 8_8_8_8 in memory order (blue first) to 1_5_5_5.
+          const uint32_t red = host[entry.target.swap_red_blue ? 0 : 2], blue = host[entry.target.swap_red_blue ? 2 : 0];
+          const uint16_t value = uint16_t((host[3] >> 7) << 15 | (red >> 3) << 10 | (host[1] >> 3) << 5 | (blue >> 3));
+          // Frames render late: an empty entry here may predate what memory export wrote since.
+          if (!value) continue;
+          std::memcpy(texel, &value, 2);
+        } else {
+          std::memcpy(texel, host, std::min(bytes, entry.host_bytes));
+        }
         xenos::SwapEndian(texel, bytes, entry.target.endian);
-        std::memcpy(guest + xenos::TiledOffset2D(int32_t(x), int32_t(y), pitch, log2), texel, bytes);
+        std::memcpy(guest + xenos::TiledOffset2D(int32_t(entry.target.x + x), int32_t(entry.target.y + y), pitch, log2),
+                    texel, bytes);
       }
     }
     entry.buffer->unmap();
     auto it = resolved_.find(entry.address);
     if (watcher_ && it != resolved_.end()) {
-      it->second.watch_stamp = watcher_->Watch(entry.address, uint32_t(size_t(entry.height) * pitch * bytes));
+      it->second.watch_stamp = watcher_->Watch(entry.address, uint32_t(size_t(entry.target.y + entry.height) * pitch * bytes));
     }
   }
   frame.read_backs.clear();
@@ -596,14 +608,14 @@ void Renderer::EndFrame(uint32_t present_address) {
                            static_cast<VulkanBuffer*>(frame.present_readback.get())->vk, 1, &region);
     frame.present_ready = true;
   }
-  for (const auto& [address, target] : read_back_) {
-    auto it = resolved_.find(address);
-    if (it == resolved_.end() || !it->second.texture) continue;
+  for (const ReadBackTarget& target : read_back_) {
+    auto it = resolved_.find(target.address);
+    if (it == resolved_.end() || !it->second.texture || !target.width || !target.height) continue;
     Texture& texture = it->second;
     Frame::ReadBack entry;
-    entry.address = address;
-    entry.width = texture.width;
-    entry.height = texture.height;
+    entry.address = target.address;
+    entry.width = target.width;
+    entry.height = target.height;
     entry.host_bytes = RenderFormatSize(texture.format);
     entry.target = target;
     entry.buffer = device_->createBuffer(
@@ -612,6 +624,7 @@ void Renderer::EndFrame(uint32_t present_address) {
     VkBufferImageCopy region{};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
+    region.imageOffset = {int32_t(target.x), int32_t(target.y), 0};
     region.imageExtent = {entry.width, entry.height, 1};
     vkCmdCopyImageToBuffer(static_cast<VulkanCommandList*>(commands_)->vk,
                            static_cast<VulkanTexture*>(texture.texture.get())->vk,
@@ -1332,13 +1345,26 @@ void Renderer::Resolve(const ResolveCall& call) {
     const uint32_t guestFormat = (info >> 7) & 0x3F;
     uint32_t guestBytes = 0;
     switch (guestFormat) {
-      case 24: case 30: guestBytes = 2; break;
-      case 6: case 7: case 25: case 31: case 36: guestBytes = 4; break;
+      case 2: guestBytes = 1; break;
+      case 3: case 24: case 30: guestBytes = 2; break;
+      case 6: case 7: case 22: case 23: case 25: case 31: case 36: guestBytes = 4; break;
       case 26: case 32: guestBytes = 8; break;
       default: break;
     }
-    if (guestBytes && !depth && uint64_t(dest.width) * dest.height * guestBytes <= 256 * 1024) {
-      read_back_[address] = {guestBytes, destPitch, info & 7};
+    // Only what this resolve wrote: tables are updated a few pages at a time.
+    const uint32_t rectWidth2 = uint32_t(std::max(rect[2] - rect[0], 0));
+    const uint32_t rectHeight2 = uint32_t(std::max(rect[3] - rect[1], 0));
+    if (guestBytes && rectWidth2 && rectHeight2 &&
+        uint64_t(rectWidth2) * rectHeight2 * guestBytes <= 256 * 1024) {
+      ReadBackTarget target{guestBytes, destPitch, info & 7};
+      target.x = uint32_t(x);
+      target.y = uint32_t(y);
+      target.width = std::min(rectWidth2, dest.width - std::min(uint32_t(x), dest.width));
+      target.height = std::min(rectHeight2, dest.height - std::min(uint32_t(y), dest.height));
+      target.address = address;
+      target.format = guestFormat;
+      target.swap_red_blue = (info >> 24) & 1;
+      read_back_.push_back(target);
     }
   }
 

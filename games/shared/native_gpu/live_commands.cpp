@@ -59,6 +59,8 @@ REXCVAR_DEFINE_BOOL(native_gpu_present_early, false, "GPU",
 REXCVAR_DEFINE_INT32(native_gpu_stats_seconds, 5, "GPU", "Log the native renderer's rate (0 = off)");
 REXCVAR_DEFINE_STRING(native_gpu_dump_addresses, "", "GPU",
                       "Resolved textures to write with the traced frame, comma separated hexadecimal");
+REXCVAR_DEFINE_BOOL(native_gpu_observe, false, "GPU", "Leave rendering to the emulated GPU, for trace comparisons");
+REXCVAR_DEFINE_INT32(native_gpu_frame_limit, 60, "GPU", "Frames per second at most, 0 for none");
 REXCVAR_DEFINE_INT32(native_gpu_trace_frame, 0, "GPU", "Log the commands of this frame");
 REXCVAR_DEFINE_STRING(native_gpu_dump_path, "native_frame.ppm", "GPU",
                       "Creating <path>.trigger writes the next front buffer here");
@@ -705,6 +707,13 @@ void OnSwap(const rex::graphics::NativeCommandEvent& event) {
     stats_start = now;
     stats_frames = 0;
   }
+  // The console's swap waits for a vertical blank; nothing here does.
+  if (const int32_t limit = REXCVAR_GET(native_gpu_frame_limit); limit > 0) {
+    static auto next = std::chrono::steady_clock::now();
+    const auto interval = std::chrono::nanoseconds(1000000000 / limit);
+    next = std::max(next + interval, std::chrono::steady_clock::now() - interval);
+    std::this_thread::sleep_until(next);
+  }
   const size_t recorded_calls = g_recording.calls.size();
   const size_t recorded_bytes = g_recording.arena.size();
   if (g_frame_number <= 6) REXLOG_INFO("native_gpu: swap {} queued, {} calls", g_frame_number, recorded_calls);
@@ -737,8 +746,24 @@ void TraceCommand(const rex::graphics::NativeCommandEvent& event, bool handled) 
       if ((t[0] & 3) == 2 && address && seen.insert(address).second) {
         const uint8_t* p = g_memory->TranslatePhysical(address);
         uint32_t nonzero = 0;
-        for (uint32_t k = 0; k < 8 * 1024 * 1024; k += 4096 + 16) nonzero += p[k] != 0 || p[k + 1] != 0;
-        REXLOG_INFO("TRACETEX {:08X} fmt={} words={:08X} {:08X} {:08X} {:08X} nonzero={}/2039", address, t[1] & 0x3F, t[0], t[1], t[2], t[3], nonzero);
+        const uint32_t width = (t[2] & 0x1FFF) + 1, height = ((t[2] >> 13) & 0x1FFF) + 1;
+        const uint32_t bytes = width * height;  // at least half the texture for every format used here
+        uint32_t samples = 0;
+        for (uint32_t k = 0; k + 1 < bytes; k += std::max(bytes / 2048, 2u), ++samples) {
+          nonzero += p[k] != 0 || p[k + 1] != 0;
+        }
+        REXLOG_INFO("TRACETEX {:08X} fmt={} {}x{} nonzero={}/{}", address, t[1] & 0x3F, width, height, nonzero, samples);
+        if ((t[1] & 0x3F) == 3) {
+          const uint32_t mips = t[5] & 0xFFFFF000;
+          const auto count = [](const uint8_t* q, uint32_t size) {
+            uint32_t n = 0;
+            for (uint32_t k = 0; k + 4 <= size; k += 4) n += (q[k] | q[k + 1] | q[k + 2] | q[k + 3]) != 0;
+            return n;
+          };
+          REXLOG_INFO("TRACETEX table words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} base nonzero {} mips {:08X} nonzero {}",
+                      t[0], t[1], t[2], t[3], t[4], t[5], count(p, 8 << 20), mips,
+                      mips ? count(g_memory->TranslatePhysical(mips), 3 << 20) : 0);
+        }
       }
     }
   }
@@ -747,17 +772,66 @@ void TraceCommand(const rex::graphics::NativeCommandEvent& event, bool handled) 
               event.count, event.indexed, event.vs_hash, event.ps_hash, r[0x2000], r[0x2001], r[0x2003], r[0x2002],
               r[0x2104], r[0x2208], r[0x2200], handled, textures);
   if (event.kind == rex::graphics::NativeCommandEvent::Kind::kCopy) {
-    REXLOG_INFO("TRACE   copy control={:08X} dest={:08X} pitch={:08X} info={:08X}", r[0x2318], r[0x2319], r[0x231A], r[0x231B]);
+    // What guest memory holds at the destination, from the last time this ran.
+    const uint32_t pitch = r[0x231A] & 0x3FFF, rows = (r[0x231A] >> 16) & 0x3FFF;
+    const uint32_t bytes = std::min<uint32_t>(pitch * rows * 2, 1 << 20);
+    const uint8_t* m = g_memory->TranslatePhysical(r[0x2319] & 0xFFFFF000);
+    uint32_t nonzero = 0, words = 0;
+    std::string sample;
+    for (uint32_t k = 0; k + 4 <= bytes; k += 4, ++words) {
+      if (m[k] | m[k + 1] | m[k + 2] | m[k + 3]) {
+        if (nonzero++ < 4) sample += fmt::format(" {:02X}{:02X}{:02X}{:02X}", m[k], m[k + 1], m[k + 2], m[k + 3]);
+      }
+    }
+    REXLOG_INFO("TRACE   guest {:08X} nonzero {}/{}{}", r[0x2319], nonzero, words, sample);
+    const uint8_t* v = g_memory->TranslatePhysical(r[kRegFetchConstants] & 0xFFFFFFFC);
+    REXLOG_INFO("TRACE   copy control={:08X} dest={:08X} pitch={:08X} info={:08X} v {} {} {} {} {} {} woff {:08X}", r[0x2318], r[0x2319], r[0x231A], r[0x231B],
+                xenos::LoadBEFloat(v), xenos::LoadBEFloat(v + 4), xenos::LoadBEFloat(v + 8), xenos::LoadBEFloat(v + 12), xenos::LoadBEFloat(v + 16), xenos::LoadBEFloat(v + 20), r[0x2080]);
   }
 }
 
 bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   using Kind = rex::graphics::NativeCommandEvent::Kind;
+  // The emulated GPU renders; the trace only looks, for a reference to compare with.
+  if (REXCVAR_GET(native_gpu_observe)) {
+    static uint32_t heavy = 0, draws = 0, table = 0, frame = 0, last_count = 0;
+    static std::map<std::string, uint32_t> recent;
+    if (event.kind != Kind::kSwap) {
+      const uint32_t* r = event.registers;
+      for (uint32_t i = 0; i < 16 && !table; ++i) {
+        const uint32_t* t = r + kRegFetchConstants + 6 * i;
+        if ((t[0] & 3) == 2 && (t[1] & 0x3F) == 3 && (t[2] & 0x1FFF) == 2047 && t[5]) table = t[5] & 0xFFFFF000;
+      }
+      recent[fmt::format("{} vs={:016X} ps={:016X} m={:X}", event.kind == Kind::kCopy ? "COPY" : "DRAW", event.vs_hash, event.ps_hash,
+                         event.kind == Kind::kCopy ? r[0x2319] >> 16 : r[0x2104])]++;
+    } else {
+      if (table && ++frame % 10 == 0) {
+        const uint8_t* q = g_memory->TranslatePhysical(table);
+        uint32_t n = 0;
+        for (uint32_t k = 0; k + 4 <= (3u << 20); k += 4) n += (q[k] | q[k + 1] | q[k + 2] | q[k + 3]) != 0;
+        if (n != last_count && (last_count == 0 || frame < 40)) {
+          REXLOG_INFO("TABLE frame {} mips {:08X} nonzero {} -> {}", frame, table, last_count, n);
+          for (const auto& [what, count] : recent) REXLOG_INFO("TABLE   {} x{}", what, count);
+        }
+        last_count = n;
+        recent.clear();
+      }
+    }
+    static bool tracing = false;
+    if (event.kind == Kind::kSwap) {
+      tracing = draws > 150 && heavy++ == 900;
+      draws = 0;
+    } else {
+      draws += event.kind == Kind::kDraw;
+      if (tracing) TraceCommand(event, false);
+    }
+    return false;
+  }
   static uint32_t draws_this_frame = 0, traced = 0;
   static bool tracing = false;
   if (event.kind == Kind::kDraw) ++draws_this_frame;
   if (event.kind == Kind::kSwap) {
-    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 150 && traced++ == 60;
+    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 150 && traced++ == 900;
     draws_this_frame = 0;
     g_trace_index = tracing ? 1 : 0;
   }

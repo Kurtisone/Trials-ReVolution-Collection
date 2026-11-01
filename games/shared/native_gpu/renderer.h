@@ -241,8 +241,10 @@ class Renderer {
   // runs frame N-1. Each slot owns what its commands use.
   struct ReadBackTarget {
     uint32_t bytes = 0, pitch = 0, endian = 0;
+    uint32_t address = 0, x = 0, y = 0, width = 0, height = 0, format = 0;
+    bool swap_red_blue = false;
   };
-  std::map<uint32_t, ReadBackTarget> read_back_;
+  std::vector<ReadBackTarget> read_back_;
   struct TraceDump {
     std::unique_ptr<plume::RenderBuffer> buffer;
     uint32_t index = 0, address = 0, width = 0, height = 0, format = 0, bytes = 0;

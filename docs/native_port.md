@@ -43,16 +43,23 @@ Traced on the first track at 20 FPS, by function. "Sure" means the arguments fit
 So draws go through D3D as in Skate, and hooking them is possible. An earlier version of this file said the opposite: it
 had traced only the `826C` part.
 
-The frame's commands: 4 segments of about 16,000 words at `1FAF0000` to `1FB30000`, written by `82228DB0` and
-`8222DA80` on the Render thread, plus about 40 small buffers replayed from `1FC93000` and `1FC94980`, whose draws are a
-series of `DRAW_INDX_2`. Those came from another path, not traced yet, and account for some of the 3,000 draws the GPU
-counts against the 1,400 above. Memory export may be among them.
+The frame's commands: 4 segments of about 16,000 words at `1FAF0000` to `1FB30000`, written on the Render thread by
+`82228DB0` and `8222DA80`, plus 42 small buffers replayed from `1FC93000` and `1FC94980`.
+
+The segments run 2 or 3 times in a frame (`1FB0` to `1FB2` twice, `1FB3` three times, `1FAF` once), the way D3D replays a
+scene for each tile with predicated tiling, as in Skate. The small buffers come in 14 groups of 24 `DRAW_INDX_2`, 336 draws.
+So 1,400 draws, about twice, plus 336, gives the 2,500 to 3,400 the GPU counts: no draws are missing. The tile functions
+are not named yet. This reading comes from one frame's buffer list. Hardware watchpoints on the small buffers, set from
+the menu through track loading, caught no writes, so they are written earlier or through another view.
+
+That replay is also a cost on the emulated path. In Skate, forcing the scene out of tiling cut draws from 2,060 to 800 a
+frame (`src/scene_tiling.cpp` there). `gpu_force_msaa_1x` does not do this.
 
 ## Order of work
 
-1. Name the rest of the state functions around `82220000` to `82230000`, as `docs/d3d_functions.md` does for Skate.
-2. Find who builds the small buffers at `1FC93000`, with a hardware watchpoint: attach gdb once on the track, then
-   `watch -l` on the buffer at guest address + `0x1A0000000`, + `0x1C0000000` and + `0x1E0000000` (physical views).
-3. Shaders: the raw microcode, for the whole set, through the SDK's translator.
-4. Render the title screen from a frame capture.
-5. Memory export: the deciding step, without which tracks have no textures.
+1. Name the rest of the state functions around `82220000` to `82230000`, and the tile functions.
+2. Shaders: the raw microcode, for the whole set, through the SDK's translator.
+3. Render the title screen from a frame capture.
+4. Memory export: the deciding step, without which tracks have no textures.
+
+To find what writes a buffer: attach gdb once in game, `watch -l` on the guest address + `0x1A0000000`.

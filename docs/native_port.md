@@ -24,7 +24,7 @@ handle it, and the virtual textures depend on it.
 
 The library is a newer build than Skate's and split in two. Part of it sits in `826C0000` to `826E0000`. The part that runs
 for each draw was compiled in with the engine's code, around `82220000` to `82230000`, probably by link time optimization.
-The device is `40852600`, passed in r3; some functions take `40852A00`, 0x400 further.
+The device is passed in r3.
 
 Traced on the first track at 20 FPS, by function. "Sure" means the arguments fit Skate's function.
 
@@ -61,26 +61,28 @@ small buffers, set from the menu through track loading, caught no writes.
 ## What Skate's renderer needs, and what Fusion's device holds
 
 Skate's native layer takes about ten hooks (draws, clear, resolve, tiling, swap, inline vertices). Everything else it reads
-at each draw from the D3D device: fetch constants at `0x480`, float constants at `0x780` and `0x1780`, register groups from
-`10368`, index buffer at `12428`, shaders at `12684` and `12688`.
+at each draw from the D3D device.
 
-Fusion's code uses the same three fields 384 bytes further: `SetIndices` (`822294B0`) keeps the index buffer at `12812`,
-`82221AB0` the vertex shader at `13072`, so the pixel shader should be at `13068`. The rest does not carry over. Read from
-outside on the first track, `40852600` holds:
+The device was `40852A00` in the runs that dumped it; `40852600` appears in one trace, so it can move between runs. Take it
+from r3 at the hook. `82228DB0` flushes state exactly as Skate's draw does: dirty masks at `0` to `40`, registers from the
+same offsets, constants from `1920` and `6016`. Dumped with gdb, stopped on a real draw on the first track:
 
-* `0x0` to `0x280`: 10 records pointing at `40867AA0` and on, then `40852A00` (the Swap's device) at `0x284`.
-* `0x480`: a table of function pointers, `826C3FE8` and neighbours: the render state setters.
-* `0xB78` to `0x2C80`: all zero. Where Skate's device keeps fetch constants, float constants and registers, there is nothing.
-* `12812`, `13068`, `13072`: 0 in all of 400 samples. `SetIndices` was also seen called with 0, so they may be cleared
-  after each draw; reading from outside can't tell.
+| Data | Skate offset | Fusion | State at a draw |
+| --- | --- | --- | --- |
+| Register groups | `10368`, `10444`, `10528`, `10548`, `10596` | same | Filled, plausible values |
+| Fetch constants | `0x480` | same | Filled |
+| Index buffer | `12428` | `12812` (+384) | Filled |
+| Float constants | `0x780`, `0x1780` | same place in the code | **All zero** |
+| Shaders | `12684`, `12688` | `13068`, `13072` (+384) | **0** |
 
-So state cannot be read from the device at draw time as in Skate, at least not from these offsets. It may live in the
-blocks at `40867AA0`, or be written straight to the command stream with no shadow. The next thing to learn is the device
-at the moment of a draw: stop on `82228DB0` with gdb and read what its code loads.
+So registers, textures and index buffers can be read as in Skate. Constants and shaders are not in the device at a draw: the
+engine must set them another way. `82225058`, called from the draw and holding an `IM_LOAD_IMM` packet, is the first thing to
+read for shaders. `8222C768` (1,689 calls a frame) and `8222C6D8` (1,637) are candidates for constants: the XDK has calls
+that give the caller a pointer straight into the command buffer, which would leave nothing in the device.
 
 ## Order of work
 
-1. Name the remaining state functions around `82220000` to `82230000`, and explain the gap in the draw count.
+1. Find how constants and shaders reach the GPU: read `82225058`, `8222C768`, `8222C6D8`.
 2. Shaders: the raw microcode, for the whole set, through the SDK's translator.
 3. Render the title screen from a frame capture.
 4. Memory export: the deciding step, without which tracks have no textures.

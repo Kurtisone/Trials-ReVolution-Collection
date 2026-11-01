@@ -58,6 +58,26 @@ The small buffers come in 14 groups of 24 `DRAW_INDX_2`, 336 draws. Known draws 
 2,500 to 3,400 the GPU counted, on other frames and on the Odin. That gap is not explained yet. Hardware watchpoints on the
 small buffers, set from the menu through track loading, caught no writes.
 
+## What Skate's renderer needs, and what Fusion's device holds
+
+Skate's native layer takes about ten hooks (draws, clear, resolve, tiling, swap, inline vertices). Everything else it reads
+at each draw from the D3D device: fetch constants at `0x480`, float constants at `0x780` and `0x1780`, register groups from
+`10368`, index buffer at `12428`, shaders at `12684` and `12688`.
+
+Fusion's code uses the same three fields 384 bytes further: `SetIndices` (`822294B0`) keeps the index buffer at `12812`,
+`82221AB0` the vertex shader at `13072`, so the pixel shader should be at `13068`. The rest does not carry over. Read from
+outside on the first track, `40852600` holds:
+
+* `0x0` to `0x280`: 10 records pointing at `40867AA0` and on, then `40852A00` (the Swap's device) at `0x284`.
+* `0x480`: a table of function pointers, `826C3FE8` and neighbours: the render state setters.
+* `0xB78` to `0x2C80`: all zero. Where Skate's device keeps fetch constants, float constants and registers, there is nothing.
+* `12812`, `13068`, `13072`: 0 in all of 400 samples. `SetIndices` was also seen called with 0, so they may be cleared
+  after each draw; reading from outside can't tell.
+
+So state cannot be read from the device at draw time as in Skate, at least not from these offsets. It may live in the
+blocks at `40867AA0`, or be written straight to the command stream with no shadow. The next thing to learn is the device
+at the moment of a draw: stop on `82228DB0` with gdb and read what its code loads.
+
 ## Order of work
 
 1. Name the remaining state functions around `82220000` to `82230000`, and explain the gap in the draw count.

@@ -25,3 +25,6 @@ gpu_force_msaa_1x = true
 vulkan_uncompressed_textures = true
 # The textures reloaded every frame (the front buffer, movie planes) are written without a copy at all.
 vulkan_storage_image_texture_loads = true
+# With the Qualcomm driver these shader modes make gl_FragCoord.xy read as 0: Trials Fusion draws its colour table from the
+# pixel position, the table came out black, and so did every track.
+vulkan_shader_float_controls = false

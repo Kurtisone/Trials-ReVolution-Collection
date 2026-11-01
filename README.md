@@ -91,7 +91,7 @@ By recompiling the original games into native PC executables, we aim to provide 
 
 ## Linux and Android
 
-Work in progress on this branch: nothing is released. Trials Fusion runs on Linux with wrong colours in tracks, and starts on Android; the other two games are untested. See
+Work in progress on this branch: nothing is released. Trials Fusion runs on Linux and on an Odin 2 Portal, with wrong colours in tracks and about 23 FPS on the Odin; the other two games are untested. See
 [docs/linux_android.md](docs/linux_android.md) for where it stands and [BUILDING.md](BUILDING.md) to build it.
 
 ## Getting started

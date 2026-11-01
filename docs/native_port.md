@@ -22,14 +22,33 @@ handle it, and the virtual textures depend on it.
 
 ## D3D entry points
 
-The library is a newer build than Skate's: matching Skate's functions with addresses masked mostly fails. Partial matches
-with few candidates put the render state setters at `826C3FE8` to `826C6100`, for instance `826C50D8` (30 of 32
-instructions, Skate's `82CB8558`, pixel center) and `826C5140` (28 of 32, index restart). The game's interrupt callback is
-`826C3270`. The rest has to be found from the registers each function writes.
+Comparing whole functions with Skate's aligns 274 of them, nearly all in `826C0000` to `826E0000`, so that is the library.
+A trace of the 985 functions from `826BC000` to `826F0000` on the first track, 20 FPS, gave:
+
+| Function | Calls per frame | What |
+| --- | --- | --- |
+| `826CB7B8` | 1 | Swap (r3 = device `40852A00`, front buffer `1F830000` in a callee) |
+| `826C3270` | 1 | Interrupt callback |
+| `826C9D38`, `826C9BE0` | 4.5 | Hold a `DRAW_INDX_2` packet |
+| `826C2780` | 2 million+ | Spin wait of the Render thread (caller `8225B138`) |
+| `826DF930`, `826DF928` | 1,800 | Small copies, caller `8221B2A0`: not D3D calls |
+
+## Draws do not go through D3D
+
+This is the main difference from Skate. The track sends 2,500 to 3,400 draws a frame to the GPU, and no D3D function runs
+anywhere near that often. The `DRAW_INDX_2` headers found in code are all in the library, on those few calls, while
+engine functions `82225058` and `822282E0` build `IM_LOAD_IMM` packets themselves. So the engine writes most of its command
+stream itself. Where its draw packets are built is not found yet: their headers don't appear as immediates, and
+`821FE4A0` and the callers around `8221B2A0` are the first places to read. Replaying prebuilt command buffers would also
+fit these numbers, and has not been ruled out.
+
+Hooking D3D as Skate does would therefore miss the scene. A native renderer has to sit on the engine's own draw layer,
+which has to be reverse engineered, or read the command stream, which is what the emulator's command processor does.
 
 ## Order of work
 
-1. Name the D3D entry points in that range: draws, shaders, textures, render targets, resolve, swap.
-2. Read the engine's shader files, or capture every shader when it is created, for the whole set.
-3. Choose the recompiler path above, and render the title screen from a frame capture.
-4. Memory export: the deciding step, without which tracks have no textures.
+1. Find what emits the draws: read the callers around `8221B2A0`, `82225058`, `822282E0`, `821FE4A0`.
+2. Name the engine's draw layer and the state it sets, as `docs/d3d_functions.md` does for Skate.
+3. Shaders: the raw microcode, for the whole set, through the SDK's translator.
+4. Render the title screen from a frame capture.
+5. Memory export: the deciding step, without which tracks have no textures.

@@ -41,6 +41,10 @@ void StartDevTools(rex::Runtime* runtime, rex::ui::WindowedAppContext& app_conte
 }  // namespace th
 #endif
 
+#if defined(TRIALS_NATIVE_GPU)
+void StartNativeGpu(rex::Runtime* runtime);
+#endif
+
 class TrialsFusionApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -94,6 +98,9 @@ class TrialsFusionApp : public rex::ReXApp {
     SetGuestFrameStats(trials::GuestFrameStats);  // the F3 overlay's frame rate
     trials::ApplyFrameRate();  // vsync off unless the launcher's frame rate is 60
     trials::ExportAchievements(runtime(), game_data_root());
+#if defined(TRIALS_NATIVE_GPU)
+    StartNativeGpu(runtime());
+#endif
 #if defined(TF_DEV_TOOLS)
     th::StartDevTools(runtime(), app_context(), PPCImageConfig.image_base, PPCImageConfig.image_size);
 #endif

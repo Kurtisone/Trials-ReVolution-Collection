@@ -1,0 +1,27 @@
+--- a
++++ b
+@@ -1191,7 +1191,7 @@
+ 
+     // Registers the code reads that no constant table entry covers (EA's
+     // shaders use raw registers next to named constants): plain loads.
+-    const uint32_t float4RegisterCount = isPixelShader ? 224 : 256;
++    const uint32_t float4RegisterCount = 256;
+     for (uint32_t i = 0; i < float4RegisterCount; i++)
+     {
+         if (float4Constants.count(i) == 0)
+@@ -1439,6 +1439,15 @@
+ 
+     bool printedRegisters[32]{};
+ 
++    // Loop counts of the pixel shader constants the raw path keeps per draw.
++    if (isPixelShader)
++    {
++        out += "#ifdef __spirv__\n";
++        out += "\tint4 i16 = int4(vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276) & 0xFF, 0, 0, 0);\n";
++        out += "\tint4 i17 = int4(vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 280) & 0xFF, 0, 0, 0);\n";
++        out += "#else\n\tint4 i16 = int4(1, 0, 0, 0);\n\tint4 i17 = int4(1, 0, 0, 0);\n#endif\n";
++    }
++
+     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
+ 
+     for (uint32_t i = 0; i < interpolatorCount; i++)

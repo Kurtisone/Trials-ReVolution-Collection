@@ -69,4 +69,23 @@ endif()
 add_subdirectory("${TRIALS_ROOT}/third_party/libadrenotools" adrenotools)
 target_link_libraries(main PRIVATE adrenotools)
 target_compile_definitions(main PRIVATE REX_HAS_ADRENOTOOLS=1)
+
+# Native renderer (docs/native_port.md). Needs out/native from tools/native/build_shaders.sh.
+if(TRIALS_GAME STREQUAL "trials_fusion" AND EXISTS "${TRIALS_ROOT}/out/native/shader_cache.cpp")
+    add_subdirectory("${TRIALS_ROOT}/third_party/plume" plume)
+    set(NATIVE "${TRIALS_ROOT}/games/shared/native_gpu")
+    target_sources(main PRIVATE
+        "${NATIVE}/native_gpu.cpp"
+        "${NATIVE}/live_commands.cpp"
+        "${NATIVE}/renderer.cpp"
+        "${TRIALS_ROOT}/third_party/smol-v/smolv.cpp"
+        "${TRIALS_ROOT}/out/native/shader_cache.cpp"
+        "${TRIALS_ROOT}/out/native/shader_containers.cpp")
+    set_source_files_properties("${TRIALS_ROOT}/out/native/shader_cache.cpp" PROPERTIES
+        INCLUDE_DIRECTORIES "${NATIVE}")
+    target_compile_definitions(main PRIVATE TRIALS_NATIVE_GPU=1)
+    target_include_directories(main PRIVATE "${NATIVE}" "${TRIALS_ROOT}/third_party/plume"
+        "${TRIALS_ROOT}/third_party/smol-v")
+    target_link_libraries(main PRIVATE plume)
+endif()
 add_dependencies(main main_hook hook_impl file_redirect_hook gsl_alloc_hook)

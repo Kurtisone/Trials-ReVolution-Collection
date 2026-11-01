@@ -626,7 +626,28 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
     call.indices_32bit = event.indices_32bit;
     call.indices_endian = event.index_endian;
   }
-  DeferredCall deferred{DeferredCall::Kind::kDraw, SnapshotState(event.registers), call, {}, {}};
+  const size_t draw_state = SnapshotState(event.registers);
+  if (event.ps_hash == 0x4FC93EEB02162879ull && g_trace_index) {  // DBG
+    const uint32_t* r = event.registers;
+    const auto c = [&](uint32_t i) { return fmt::format("c{} {} {} {} {}", i, std::bit_cast<float>(r[kRegFloatConstants + (256 + i) * 4]), std::bit_cast<float>(r[kRegFloatConstants + (256 + i) * 4 + 1]), std::bit_cast<float>(r[kRegFloatConstants + (256 + i) * 4 + 2]), std::bit_cast<float>(r[kRegFloatConstants + (256 + i) * 4 + 3])); };
+    static int probes = 0;
+    if (probes++ < 8) REXLOG_INFO("PROBE ps={:016X} blend {:08X} {:08X} {:08X} {:08X} mask {:08X} colorctl {:08X} {} {} {} {}", event.ps_hash, r[0x2201], r[0x2202], r[0x2203], r[0x2204], r[0x2104], r[0x2208], c(0), c(1), c(2), c(27));
+    const size_t st = SnapshotState(r);
+    uint8_t* a = g_recording.arena.data() + st;
+    PutReg(a, 0x2319, 0x1FF00000u);
+    PutReg(a, 0x231A, 0x02600400u);
+    PutReg(a, 0x231B, 0x0000F001u);
+    native_gpu::ResolveCall probe;
+    probe.has_rect = true;
+    probe.rect[2] = 1024;
+    probe.rect[3] = 608;
+    probe.source_scale = 1;
+    probe.trace_index = g_trace_index++;
+    g_recording.dump = true;
+    g_recording.dump_addresses.push_back(0x1FF00000u);
+    g_recording.calls.push_back(DeferredCall{DeferredCall::Kind::kResolve, st, {}, {}, probe});
+  }
+  DeferredCall deferred{DeferredCall::Kind::kDraw, draw_state, call, {}, {}};
   g_recording.calls.push_back(deferred);
   return true;
 }

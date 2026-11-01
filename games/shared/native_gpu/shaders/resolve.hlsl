@@ -42,6 +42,10 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
         uint packed = (uint(saturate(value.x) * 16777215.0 + 0.5) << 8) | stencil;
         return float4(packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF, packed >> 24) / 255.0;
     }
+    if (g_Push.Mode == 6)
+    {
+        return value.xxxx;
+    }
     if (g_Push.Mode == 3)
     {
         return value.bgra;

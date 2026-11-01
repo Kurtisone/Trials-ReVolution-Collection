@@ -190,6 +190,11 @@ RenderFormat TextureFormat(const xenos::TextureFetch& t) {
 
 // EDRAM color formats (RB_COLOR_INFO) as host render target formats. 16_16
 // and 16_16_16_16 hold -32..32 in EDRAM, kept as floats here.
+// The _AS_ formats are other views of the same EDRAM bits: draws in one are resolved in the other.
+uint32_t EdramFormat(uint32_t color_format) {
+  return color_format == 10 ? 2 : color_format == 12 ? 3 : color_format;
+}
+
 RenderFormat SurfaceFormat(uint32_t color_format) {
   switch (color_format) {
     case 0: case 1: return RenderFormat::R8G8B8A8_UNORM;  // 8_8_8_8 (_GAMMA)
@@ -1139,7 +1144,7 @@ Renderer::Texture& Renderer::GetColorSurface(const xenos::DeviceState& state) {
   const uint32_t surface = state.Reg(xenos::reg::RB_SURFACE_INFO);
   const uint32_t color = state.Reg(xenos::reg::RB_COLOR_INFO);
   const uint32_t pitch = std::max(surface & 0x3FFF, 1u);
-  const uint32_t format = (color >> 16) & 0xF;
+  const uint32_t format = EdramFormat((color >> 16) & 0xF);
   const float scale = SurfaceScale(pitch);
   const uint64_t key = uint64_t(color & 0xFFF) | uint64_t(format) << 12 | uint64_t(pitch) << 16 |
                        uint64_t(scale * 4.0f) << 40 | uint64_t(SurfaceWide(pitch) * 16.0f) << 48;
@@ -1157,7 +1162,7 @@ Renderer::Texture& Renderer::GetColor1Surface(const xenos::DeviceState& state) {
   const uint32_t surface = state.Reg(xenos::reg::RB_SURFACE_INFO);
   const uint32_t color = state.Reg(0x2003);  // RB_COLOR1_INFO
   const uint32_t pitch = std::max(surface & 0x3FFF, 1u);
-  const uint32_t format = (color >> 16) & 0xF;
+  const uint32_t format = EdramFormat((color >> 16) & 0xF);
   const float scale = SurfaceScale(pitch);
   const uint64_t key = uint64_t(color & 0xFFF) | uint64_t(format) << 12 | uint64_t(pitch) << 16 |
                        uint64_t(scale * 4.0f) << 40 | uint64_t(SurfaceWide(pitch) * 16.0f) << 48;
@@ -1372,8 +1377,9 @@ void Renderer::Resolve(const ResolveCall& call) {
   ResolvePushConstants push{source.index, 0, 1.0f, int32_t((rect[0] - x) * step * scaleX),
                             int32_t((rect[1] - y) * step * scale), source.stencil_index, step};
   if (depth) {
-    format = RenderFormat::R8G8B8A8_UNORM;
-    push.mode = 1;
+    // Fetched as 24_8_FLOAT: the depth itself in x, unlike Skate's stencil tags in packed bytes.
+    format = RenderFormat::R32_FLOAT;
+    push.mode = 6;
   } else if (format == RenderFormat::R8G8B8A8_UNORM) {
     const uint32_t copyInfo = call.state.Reg(0x231B);
     if (((copyInfo >> 7) & 0x3F) == 3 && ((copyInfo >> 16) & 0x3F) == 8) {

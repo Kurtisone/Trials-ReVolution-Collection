@@ -9,9 +9,21 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, 45 to 67 FPS. Geometry shows in depth and normals, base colours are black, so the lighting buffer
-  is zero, exposure is zero and the picture is white. **These figures are not the game's speed**: lighting and virtual
-  textures do not work yet.
+* First track: reached, capped at 60 FPS, 12 ms a frame on the renderer thread. Geometry shows in depth and normals; the
+  picture is still white. **These figures are not the game's speed**: base colours and lighting do not work yet.
+* Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
+  95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
+  integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
+* `getCompTexLOD` was dropped by XenosRecomp, so setTexLOD got a stale register; fixed in tools/native/xenosrecomp.patch.
+
+Next, in order (2026-11-01, track frame traced with `native_gpu_trace_frame = -1`, more than 800 draws):
+
+1. Albedo `14E11000` is zero though normals are right. Terrain writes `oC0 = colour * t1`, and t1/t2, the 4096x4096 DXT atlases
+   1D261000 and 1C261000, read as zero in guest memory. Nothing yet says what fills them. Lead, unproven: the memory export
+   shaders not in the cache (BCFF66D9, 758C4BE0, DDED7E53, 6E11F29E, 1EDA3CCD), which go to the plugin.
+2. Destination format 25 with exponent bias 10 (`info=000A6C81`) is resolved to R16G16_UNORM with the bias ignored; the
+   luminance pyramid 150AD000 reads (0, 1), then A8BB5EBB writes zero. Bias is real: it is what makes the table's integers.
+3. With exposure zero the tonemap 3EBCA95D saturates: expect white until 1 and 2 are done.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

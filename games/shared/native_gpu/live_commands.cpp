@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -601,6 +602,7 @@ const uint8_t* FindContainer(uint64_t key) {
   return it == g_containers.end() ? nullptr : it->second;
 }
 
+uint32_t g_trace_index = 0;
 bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   if (!event.vs_ucode) return true;
   const KnownShader& vertex = FindShader(event.vs_hash, event.vs_ucode, event.vs_dwords);
@@ -629,7 +631,6 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   return true;
 }
 
-uint32_t g_trace_index = 0;
 bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
   const uint32_t* regs = event.registers;
   const uint32_t control = regs[0x2318];  // RB_COPY_CONTROL
@@ -650,6 +651,10 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
     rect[3] = std::max(rect[3], y);
   }
   const int scale = Surface4x(regs) ? 2 : 1;
+  if (((regs[0x231B] >> 7) & 0x3F) == 3 && (rect[2] - rect[0] > 256 || event.ps_hash == 0x0D26ADDF22CBC739ull)) {
+    REXLOG_INFO("BIGTABLE ps={:016X} dest={:08X} pitch={:08X} rect {} {} {} {} surf={:08X} c0={:08X}", event.ps_hash, regs[0x2319],
+                regs[0x231A], rect[0], rect[1], rect[2], rect[3], regs[0x2000], regs[0x2001]);
+  }
   const size_t state = SnapshotState(regs);
   // The renderer resolves RB_COLOR_INFO: put the selected target there.
   if (!depth && source) {
@@ -663,6 +668,7 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
     std::copy(rect, rect + 4, call.rect);
     call.source_scale = scale;
     call.trace_index = g_trace_index ? g_trace_index++ : 0;
+    if (call.trace_index) g_recording.dump = true;
     DeferredCall deferred{DeferredCall::Kind::kResolve, state, {}, {}, call};
     g_recording.calls.push_back(deferred);
   }
@@ -831,14 +837,15 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   static bool tracing = false;
   if (event.kind == Kind::kDraw) ++draws_this_frame;
   if (event.kind == Kind::kSwap) {
-    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 150 && traced++ == 900;
+    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 800 && traced++ == 240;
     draws_this_frame = 0;
     g_trace_index = tracing ? 1 : 0;
   }
   if ((tracing || int32_t(g_frame_number) == REXCVAR_GET(native_gpu_trace_frame)) && event.kind != Kind::kSwap) {
     bool handled = event.kind == Kind::kCopy ? OnCopy(event) : OnDraw(event);
     TraceCommand(event, handled);
-    if (event.kind == Kind::kCopy && ((event.registers[0x2318] >> 20) & 3) != 3) {
+    if (event.kind == Kind::kCopy && ((event.registers[0x2318] >> 20) & 3) != 3 &&
+        (event.registers[0x2319] & 0xFF000000) != 0x1E000000) {
       g_recording.dump_addresses.push_back(event.registers[0x2319] & 0xFFFFF000);
       g_recording.dump = true;
     }

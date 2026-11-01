@@ -46,6 +46,11 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
     {
         return value.bgra;
     }
+    if (g_Push.Mode == 5)
+    {
+        // A 1_5_5_5 destination with an exponent of 8 holds the source bytes as integers.
+        return min(round(value * 255.0), float4(31.0, 31.0, 31.0, 1.0));
+    }
     return value * g_Push.Scale;
 }
 

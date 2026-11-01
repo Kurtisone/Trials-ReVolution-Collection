@@ -1,6 +1,6 @@
 --- a/shader_recompiler.cpp
 +++ b/shader_recompiler.cpp
-@@ -225,6 +225,13 @@
+@@ -225,6 +225,22 @@
  
  void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
  {
@@ -11,10 +11,19 @@
 +        return;
 +    }
 +
++    if (instr.opcode == FetchOpcode::GetTextureComputedLod)
++    {
++        // The level the hardware would pick, in the destination's x: Fusion hands it to setTexLOD.
++        indent();
++        println("r{}.x = compTexLod2D(s{}_Texture2DDescriptorIndex, s{}_SamplerDescriptorIndex, r{}.{}{});", instr.dstRegister,
++            instr.constIndex, instr.constIndex, instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3], SWIZZLES[(instr.srcSwizzle >> 2) & 0x3]);
++        return;
++    }
++
      if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
          return;
  
-@@ -326,6 +333,13 @@
+@@ -326,6 +342,13 @@
  
      out += dimension;
  
@@ -28,7 +37,7 @@
  #ifdef UNLEASHED_RECOMP
      if (bicubic)
          out += "Bicubic";
-@@ -338,6 +352,8 @@
+@@ -338,6 +361,8 @@
      {
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
@@ -37,7 +46,7 @@
          break;
      case TextureDimension::TextureCube:
          out += ", cubeMapData";
-@@ -1191,7 +1207,7 @@
+@@ -1191,7 +1216,7 @@
  
      // Registers the code reads that no constant table entry covers (EA's
      // shaders use raw registers next to named constants): plain loads.
@@ -46,7 +55,7 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
-@@ -1357,10 +1373,10 @@
+@@ -1357,10 +1382,10 @@
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
  
@@ -58,7 +67,7 @@
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
-@@ -1439,6 +1455,15 @@
+@@ -1439,6 +1464,15 @@
  
      bool printedRegisters[32]{};
  
@@ -74,7 +83,7 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
-@@ -1485,12 +1510,11 @@
+@@ -1485,12 +1519,11 @@
              {
                  out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
@@ -90,7 +99,7 @@
              else
              {
                  out += "0.0;\n";
-@@ -1500,6 +1524,7 @@
+@@ -1500,6 +1533,7 @@
  
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
@@ -100,7 +109,7 @@
      if (isPixelShader)
 --- a/shader_common.h
 +++ b/shader_common.h
-@@ -67,6 +67,23 @@
+@@ -67,6 +67,29 @@
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  
@@ -113,6 +122,12 @@
 +    float2 dimensions = float2(width, height);
 +    float2 uv = denormalized ? (texCoord + offset) / dimensions : texCoord + offset / dimensions;
 +    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], uv, lod);
++}
++
++float compTexLod2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.CalculateLevelOfDetail(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
 +}
 +
 +float4 tfetch2DDenorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)

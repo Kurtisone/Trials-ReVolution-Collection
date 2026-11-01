@@ -851,6 +851,11 @@ uint32_t Renderer::GetSampler(const xenos::TextureFetch& t) {
   // Mip filter: 0 point, 1 linear, 2 base map only.
   desc.mipmapMode = t.mip_filter == 1 ? RenderMipmapMode::LINEAR : RenderMipmapMode::NEAREST;
   desc.maxLOD = t.mip_filter == 2 ? 0.0f : 16.0f;
+  // The table's levels are read by number (setTexLOD).
+  if (t.format == xenos::kTex_1_5_5_5 && t.width == 2048) {
+    desc.maxLOD = 16.0f;
+    desc.mipmapMode = RenderMipmapMode::NEAREST;
+  }
   desc.mipLODBias = t.lod_bias;
   // 0 disabled, 1 to 5: 1:1 to 16:1.
   if (t.aniso_filter >= 2 && t.aniso_filter <= 5) {
@@ -880,6 +885,55 @@ Renderer::Texture* Renderer::GetGuestTexture(const xenos::TextureFetch& t) {
                              t.width, t.height, t.depth, t.swizzle, t.is_signed};
   auto [it, inserted] = guest_textures_.try_emplace(XXH3_64bits(fields, sizeof(fields)));
   Texture& guest = it->second;
+  if (t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address) {
+    // The virtual texture table: the game rewrites it block by block through resolves and reads
+    // it back in the same frame, so it lives on the host (see CopyResolveToTable).
+    if (guest.texture) return &guest;
+    table_levels_ = xenos::GetMipLevels(t);
+    // The fetch is integer (the shaders scale by 1/255): raw values, which unorm cannot hold.
+    guest.format = RenderFormat::R16G16B16A16_FLOAT;
+    guest.width = t.width;
+    guest.height = t.height;
+    guest.dimension = t.dimension;
+    guest.texture = device_->createTexture(RenderTextureDesc::Texture(
+        RenderTextureDimension::TEXTURE_2D, t.width, t.height, 1, uint32_t(table_levels_.size()), 1, guest.format,
+        RenderTextureFlag::NONE));
+    Transition(guest.texture.get(), RenderTextureLayout::COPY_DEST);
+    for (uint32_t level = 0; level < table_levels_.size(); ++level) {
+      const xenos::MipLevel& m = table_levels_[level];
+      const uint64_t size = uint64_t(m.width) * m.height * 8;
+      if (size > 256 * 256 * 8) {
+        // Too much for the frame's upload buffer in one go: left undefined would read as garbage.
+        const uint32_t rows = m.height;
+        for (uint32_t y = 0; y < rows; y += 128) {
+          const uint32_t count = std::min(128u, rows - y);
+          const uint64_t part = uint64_t(m.width) * count * 8;
+          const uint64_t at = Allocate(nullptr, part, 512);
+          std::memset(upload_memory_ + at, 0, part);
+          commands_->copyTextureRegion(RenderTextureCopyLocation::Subresource(guest.texture.get(), level, 0),
+                                       RenderTextureCopyLocation::PlacedFootprint(upload_, guest.format, m.width, count, 1, m.width, at),
+                                       0, y, 0);
+        }
+        continue;
+      }
+      const uint64_t at = Allocate(nullptr, size, 512);
+      std::memset(upload_memory_ + at, 0, size);
+      commands_->copyTextureRegion(RenderTextureCopyLocation::Subresource(guest.texture.get(), level, 0),
+                                   RenderTextureCopyLocation::PlacedFootprint(upload_, guest.format, m.width, m.height, 1, m.width, at));
+    }
+    Transition(guest.texture.get(), RenderTextureLayout::SHADER_READ);
+    RenderTextureViewDesc view;
+    view.format = guest.format;
+    view.dimension = RenderTextureViewDimension::TEXTURE_2D;
+    view.mipLevels = uint32_t(table_levels_.size());
+    // No swizzle: the resolve's red/blue swap and the fetch's undo each other.
+    guest.view = guest.texture->createTextureView(view);
+    guest.index = AllocateSlot(1);
+    texture_2d_set_->setTexture(guest.index, guest.texture.get(), RenderTextureLayout::SHADER_READ, guest.view.get());
+    table_texture_ = guest.texture.get();
+    ++texture_generation_;
+    return &guest;
+  }
   const uint32_t byteSize = xenos::TextureByteSize(t);
   static const bool verifyTextures = getenv("NATIVE_GPU_VERIFY_TEXTURES") != nullptr;  // debugging
   if (!inserted && !verifyTextures && guest.texture &&
@@ -1231,6 +1285,67 @@ void Renderer::RetireResolved(Texture& dest) {
   for (auto& [swizzle, entry] : dest.swizzled_views) retired_views_.push_back(std::move(entry.first));
 }
 
+// A resolve into the virtual texture table: finds the level and block its address means and
+// copies there, on the GPU and in command order.
+void Renderer::CopyResolveToTable(Texture& source, uint32_t address, uint32_t width, uint32_t height) {
+  int32_t found = -1;
+  uint32_t best = 0;
+  for (uint32_t level = 0; level < table_levels_.size(); ++level) {
+    const xenos::MipLevel& m = table_levels_[level];
+    if (address < m.address) continue;
+    if (found < 0 || m.address > best || (m.address == best && m.width == width)) {
+      found = int32_t(level);
+      best = m.address;
+    }
+  }
+  if (found < 0) {
+    ++stats_["table: resolve outside the table"];
+    return;
+  }
+  const xenos::MipLevel& m = table_levels_[uint32_t(found)];
+  const uint32_t offset = address - m.address;
+  uint32_t x = m.x_blocks, y = m.y_blocks;
+  if (offset) {
+    bool located = false;
+    for (uint32_t row = 0; row < m.height && !located; row += 32) {
+      for (uint32_t column = 0; column < m.width; column += 32) {
+        if (uint32_t(xenos::TiledOffset2D(int32_t(column), int32_t(row), m.pitch_blocks, 1)) == offset) {
+          x = column;
+          y = row;
+          located = true;
+          break;
+        }
+      }
+    }
+    if (!located) {
+      ++stats_["table: block not located"];
+      static int logged = 0;
+      if (logged++ < 12) {
+        fprintf(stderr, "table: %08X level %d at %08X offset %X not located\n", address, found, m.address, offset);
+      }
+      return;
+    }
+  }
+  width = std::min(width, m.width - std::min(x, m.width));
+  height = std::min(height, m.height - std::min(y, m.height));
+  if (!width || !height) return;
+  ++stats_["table: blocks copied, level " + std::to_string(found)];
+  {
+    static std::map<uint32_t, int> seen;
+    if (seen.size() < 40 && !seen.count(address)) {
+      seen[address] = found;
+      fprintf(stderr, "table: %08X %ux%u -> level %d (%ux%u at %08X pitch %u) at %u,%u\n", address, width, height, found, m.width, m.height, m.address, m.pitch_blocks, x, y);
+    }
+  }
+  Transition(source.texture.get(), RenderTextureLayout::COPY_SOURCE);
+  Transition(table_texture_, RenderTextureLayout::COPY_DEST);
+  const RenderBox box(0, 0, int32_t(width), int32_t(height));
+  commands_->copyTextureRegion(RenderTextureCopyLocation::Subresource(table_texture_, uint32_t(found), 0),
+                               RenderTextureCopyLocation::Subresource(source.texture.get(), 0, 0), x, y, 0, &box);
+  Transition(table_texture_, RenderTextureLayout::SHADER_READ);
+  Transition(source.texture.get(), RenderTextureLayout::SHADER_READ);
+}
+
 void Renderer::Resolve(const ResolveCall& call) {
   const bool depth = call.flags & 4;
   Texture& source = depth ? GetDepthSurface(call.state) : GetColorSurface(call.state);
@@ -1260,7 +1375,13 @@ void Renderer::Resolve(const ResolveCall& call) {
     format = RenderFormat::R8G8B8A8_UNORM;
     push.mode = 1;
   } else if (format == RenderFormat::R8G8B8A8_UNORM) {
-    push.mode = 3;
+    const uint32_t copyInfo = call.state.Reg(0x231B);
+    if (((copyInfo >> 7) & 0x3F) == 3 && ((copyInfo >> 16) & 0x3F) == 8) {
+      push.mode = 5;
+      format = RenderFormat::R16G16B16A16_FLOAT;
+    } else {
+      push.mode = 3;
+    }
   } else if (format == RenderFormat::R16G16_FLOAT) {
     // A resolve converts: the EDRAM value (fixed point, -32..32) is written
     // in the destination format, here the unsigned normalized 16_16 the
@@ -1343,6 +1464,18 @@ void Renderer::Resolve(const ResolveCall& call) {
   {
     const uint32_t info = call.state.Reg(0x231B);
     const uint32_t guestFormat = (info >> 7) & 0x3F;
+    if (guestFormat == 3 && !depth) {
+      // The first writes come before any draw has read the table.
+      for (uint32_t slot = 0; slot < 32 && !table_texture_; ++slot) {
+        const xenos::TextureFetch t = xenos::DecodeTextureFetch(call.state, slot);
+        if (t.valid && t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address) GetGuestTexture(t);
+      }
+      if (table_texture_) {
+        CopyResolveToTable(dest, address, uint32_t(rect[2] - rect[0]), uint32_t(rect[3] - rect[1]));
+      } else {
+        ++stats_["table: resolve before the table exists"];
+      }
+    }
     uint32_t guestBytes = 0;
     switch (guestFormat) {
       case 2: guestBytes = 1; break;
@@ -1354,7 +1487,7 @@ void Renderer::Resolve(const ResolveCall& call) {
     // Only what this resolve wrote: tables are updated a few pages at a time.
     const uint32_t rectWidth2 = uint32_t(std::max(rect[2] - rect[0], 0));
     const uint32_t rectHeight2 = uint32_t(std::max(rect[3] - rect[1], 0));
-    if (guestBytes && rectWidth2 && rectHeight2 &&
+    if (guestBytes && guestFormat != 3 && rectWidth2 && rectHeight2 &&
         uint64_t(rectWidth2) * rectHeight2 * guestBytes <= 256 * 1024) {
       ReadBackTarget target{guestBytes, destPitch, info & 7};
       target.x = uint32_t(x);
@@ -1387,13 +1520,17 @@ void Renderer::Resolve(const ResolveCall& call) {
 void Renderer::Draw(const DrawCall& call) {
   const xenos::DeviceState& state = call.state;
   RenderPrimitiveTopology topology;
-  bool quads = false;
+  bool quads = false, rects = false;
   switch (call.primitive) {
     case 1: topology = RenderPrimitiveTopology::POINT_LIST; break;
     case 2: topology = RenderPrimitiveTopology::LINE_LIST; break;
     case 3: topology = RenderPrimitiveTopology::LINE_STRIP; break;
     case 4: topology = RenderPrimitiveTopology::TRIANGLE_LIST; break;
     case 6: topology = RenderPrimitiveTopology::TRIANGLE_STRIP; break;
+    case 8:  // rectangle list: three corners each, the fourth worked out below
+      topology = RenderPrimitiveTopology::TRIANGLE_LIST;
+      rects = true;
+      break;
     case 13:  // quad list: expanded to triangles below
       topology = RenderPrimitiveTopology::TRIANGLE_LIST;
       quads = true;
@@ -1602,6 +1739,62 @@ void Renderer::Draw(const DrawCall& call) {
       vertexLayout.slot_layouts[slot] = layout;
     }
     const uint32_t address = fetch.address & 0x1FFFFFFF;
+    if (rects && !call.indices_size && stride) {
+      // Each rectangle becomes two triangles. The fourth corner is the sum of the two ends
+      // of the diagonal, the longest side, less the third, in every float element.
+      const uint32_t rectCount = call.count / 3;
+      const uint32_t size = rectCount * 3 * stride;
+      convert_buffer_.assign(physical_ + address + call.start * stride, physical_ + address + call.start * stride + size);
+      convert(convert_buffer_.data(), size, fetch.endian);
+      std::vector<uint8_t> expanded(size_t(rectCount) * 6 * stride);
+      for (uint32_t r = 0; r < rectCount; ++r) {
+        const uint8_t* v = convert_buffer_.data() + size_t(r) * 3 * stride;
+        const auto corner = [&](uint32_t i) {
+          float xy[2];
+          std::memcpy(xy, v + i * stride, 8);
+          return std::array<float, 2>{xy[0], xy[1]};
+        };
+        const auto distance = [&](uint32_t a, uint32_t b) {
+          const auto p = corner(a), q = corner(b);
+          return (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]);
+        };
+        const float d01 = distance(0, 1), d12 = distance(1, 2), d02 = distance(0, 2);
+        uint32_t a = 0, b = 2, c = 1;
+        if (d01 >= d12 && d01 >= d02) {
+          a = 0, b = 1, c = 2;
+        } else if (d12 >= d01 && d12 >= d02) {
+          a = 1, b = 2, c = 0;
+        }
+        uint8_t* out = expanded.data() + size_t(r) * 6 * stride;
+        const uint32_t order[5] = {a, c, b, a, b};
+        for (uint32_t i = 0; i < 5; ++i) std::memcpy(out + i * stride, v + order[i] * stride, stride);
+        uint8_t* fourth = out + 5 * stride;
+        std::memcpy(fourth, v + a * stride, stride);
+        for (const RenderInputElement& element : inputElements) {
+          if (element.slotIndex != slot) continue;
+          uint32_t components = 0;
+          switch (element.format) {
+            case RenderFormat::R32_FLOAT: components = 1; break;
+            case RenderFormat::R32G32_FLOAT: components = 2; break;
+            case RenderFormat::R32G32B32_FLOAT: components = 3; break;
+            case RenderFormat::R32G32B32A32_FLOAT: components = 4; break;
+            default: break;
+          }
+          for (uint32_t k = 0; k < components; ++k) {
+            const uint32_t at = element.alignedByteOffset + 4 * k;
+            float x, y, z;
+            std::memcpy(&x, v + a * stride + at, 4);
+            std::memcpy(&y, v + b * stride + at, 4);
+            std::memcpy(&z, v + c * stride + at, 4);
+            const float w = x + y - z;
+            std::memcpy(fourth + at, &w, 4);
+          }
+        }
+      }
+      const uint64_t at = Allocate(expanded.data(), expanded.size(), 16);
+      vertexViews.push_back({upload_->at(at), uint32_t(expanded.size())});
+      continue;
+    }
     const auto fill = [&](uint8_t* data) { convert(data, fetch.size, fetch.endian); };
     const RenderBuffer* buffer =
         GetGuestBuffer(address, fetch.size, vertexLayout.slot_layouts[slot] ^ fetch.endian, std::ref(fill));
@@ -1625,7 +1818,9 @@ void Renderer::Draw(const DrawCall& call) {
     }
     const xenos::TextureFetch t = xenos::DecodeTextureFetch(state, slot);
     if (!t.valid) continue;
-    auto resolved = resolved_.find(t.address);
+    // A block resolved at the table's base address is part of the table, not a texture.
+    const bool table = t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address;
+    auto resolved = table ? resolved_.end() : resolved_.find(t.address);
     if (resolved != resolved_.end() && watcher_ &&
         watcher_->Dirty(t.address & 0x1FFFFFFF, resolved->second.resolved_size,
                         resolved->second.watch_stamp)) {
@@ -1874,7 +2069,9 @@ void Renderer::Draw(const DrawCall& call) {
   }
   commands_->setGraphicsPushConstants(0, pushConstants);
   commands_->setVertexBuffers(0, vertexViews.data(), uint32_t(vertexViews.size()), inputSlots.data());
-  if (call.indices_size && quads) {
+  if (rects) {
+    commands_->drawInstanced(call.count / 3 * 6, 1, 0, 0);
+  } else if (call.indices_size && quads) {
     // Each four indices make two triangles.
     std::vector<uint8_t> guest(call.indices_size);
     std::memcpy(guest.data(), physical_ + (call.indices_address & 0x1FFFFFFF), guest.size());

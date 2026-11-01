@@ -213,6 +213,7 @@ class Renderer {
   Texture& CreateSurface(uint64_t key, uint32_t width, uint32_t height, plume::RenderFormat format,
                          bool depth);
   void Transition(plume::RenderTexture* texture, plume::RenderTextureLayout layout);
+  void CopyResolveToTable(Texture& source, uint32_t address, uint32_t width, uint32_t height);
   void SetTargets(plume::RenderTexture* color, plume::RenderTexture* depth,
                   plume::RenderTexture* color1 = nullptr);
   void SetMainLayout();
@@ -245,6 +246,8 @@ class Renderer {
     bool swap_red_blue = false;
   };
   std::vector<ReadBackTarget> read_back_;
+  plume::RenderTexture* table_texture_ = nullptr;
+  std::vector<xenos::MipLevel> table_levels_;
   struct TraceDump {
     std::unique_ptr<plume::RenderBuffer> buffer;
     uint32_t index = 0, address = 0, width = 0, height = 0, format = 0, bytes = 0;

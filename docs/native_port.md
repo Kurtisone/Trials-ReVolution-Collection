@@ -22,33 +22,37 @@ handle it, and the virtual textures depend on it.
 
 ## D3D entry points
 
-Comparing whole functions with Skate's aligns 274 of them, nearly all in `826C0000` to `826E0000`, so that is the library.
-A trace of the 985 functions from `826BC000` to `826F0000` on the first track, 20 FPS, gave:
+The library is a newer build than Skate's and split in two. Part of it sits in `826C0000` to `826E0000`. The part that runs
+for each draw was compiled in with the engine's code, around `82220000` to `82230000`, probably by link time optimization.
+The device is `40852600`, passed in r3; some functions take `40852A00`, 0x400 further.
 
-| Function | Calls per frame | What |
-| --- | --- | --- |
-| `826CB7B8` | 1 | Swap (r3 = device `40852A00`, front buffer `1F830000` in a callee) |
-| `826C3270` | 1 | Interrupt callback |
-| `826C9D38`, `826C9BE0` | 4.5 | Hold a `DRAW_INDX_2` packet |
-| `826C2780` | 2 million+ | Spin wait of the Render thread (caller `8225B138`) |
-| `826DF930`, `826DF928` | 1,800 | Small copies, caller `8221B2A0`: not D3D calls |
+Traced on the first track at 20 FPS, by function. "Sure" means the arguments fit Skate's function.
 
-## Draws do not go through D3D
+| Function | Calls per frame | What | Confidence |
+| --- | --- | --- | --- |
+| `82228DB0` | 1,400 | DrawIndexedVertices: device, 4 (triangle list), base vertex, start index, index count | sure |
+| `822294B0` | 1,400 | SetIndices, device in r3; best match of Skate's `82CB95A8` | likely |
+| `8222FDF8` | not traced in numbers yet | DrawVertices, best match of Skate's `82CB3500` | guess |
+| `82221AB0` | | SetVertexShader, best match of Skate's `82CBE2E8` | guess |
+| `822230D8` | | SetTexture, best match of Skate's `82CCB4D0` | guess |
+| `82229228`, `8222DA80`, `822287C8` | 1,400, 940, 940 | Engine's draw submission, callers of the above | seen |
+| `826CB7B8` | 1 | Swap, device `40852A00`, front buffer `1F830000` in a callee | sure |
+| `826C3270` | 1 | Interrupt callback | sure |
+| `826C2780` | 2 million+ | Spin wait of the Render thread (caller `8225B138`) | seen |
 
-This is the main difference from Skate. The track sends 2,500 to 3,400 draws a frame to the GPU, and no D3D function runs
-anywhere near that often. The `DRAW_INDX_2` headers found in code are all in the library, on those few calls, while
-engine functions `82225058` and `822282E0` build `IM_LOAD_IMM` packets themselves. So the engine writes most of its command
-stream itself. Where its draw packets are built is not found yet: their headers don't appear as immediates, and
-`821FE4A0` and the callers around `8221B2A0` are the first places to read. Replaying prebuilt command buffers would also
-fit these numbers, and has not been ruled out.
+So draws go through D3D as in Skate, and hooking them is possible. An earlier version of this file said the opposite: it
+had traced only the `826C` part.
 
-Hooking D3D as Skate does would therefore miss the scene. A native renderer has to sit on the engine's own draw layer,
-which has to be reverse engineered, or read the command stream, which is what the emulator's command processor does.
+The frame's commands: 4 segments of about 16,000 words at `1FAF0000` to `1FB30000`, written by `82228DB0` and
+`8222DA80` on the Render thread, plus about 40 small buffers replayed from `1FC93000` and `1FC94980`, whose draws are a
+series of `DRAW_INDX_2`. Those came from another path, not traced yet, and account for some of the 3,000 draws the GPU
+counts against the 1,400 above. Memory export may be among them.
 
 ## Order of work
 
-1. Find what emits the draws: read the callers around `8221B2A0`, `82225058`, `822282E0`, `821FE4A0`.
-2. Name the engine's draw layer and the state it sets, as `docs/d3d_functions.md` does for Skate.
+1. Name the rest of the state functions around `82220000` to `82230000`, as `docs/d3d_functions.md` does for Skate.
+2. Find who builds the small buffers at `1FC93000`, with a hardware watchpoint: attach gdb once on the track, then
+   `watch -l` on the buffer at guest address + `0x1A0000000`, + `0x1C0000000` and + `0x1E0000000` (physical views).
 3. Shaders: the raw microcode, for the whole set, through the SDK's translator.
 4. Render the title screen from a frame capture.
 5. Memory export: the deciding step, without which tracks have no textures.

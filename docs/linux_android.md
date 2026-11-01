@@ -46,11 +46,13 @@ change that conflicts with the Android work. Look there first if Trials HD is to
 * Skate runs on the same SDK with the same picture as before.
 * All three games' own code compiles for both platforms.
 * The launcher runs on Linux. Trials Fusion builds into a signed arm64 APK.
+* That APK runs on an AYN Odin 2 Portal (Adreno 740) with the system's Qualcomm driver: picture and sound in the intro
+  movie, about 6 FPS there, held back by the game's side (175 ms a frame, GPU 19 ms).
 
 ## What has not
 
 * Trials HD and Trials Evolution have not been built.
-* Nothing has run on an Android device. Trials Fusion's APK builds and is signed, and that is all that is known of it.
+* On Android, anything past the intro movie: menus, tracks, the controller and the frame rate in play.
 * Starting a game from the launcher, and installing a package with it. Sound (the test machine has no audio).
 * Scores above 720p: all of the above is at 720p.
 
@@ -68,6 +70,12 @@ Ruled out, each by a run: the 8 bit integer scale, integer fetches, the exponent
 `readback_resolve = full`, the 3D-as-2D wrappers, the 3D texture's load and sampling (fixed lookups at Z 0 and Z 8 give the
 table's colours), the pixel position and `log` / `exp` (same as DXBC, by reading). Next: compare that pass's float
 constants with a Windows run; c251 to c255 hold its matrix and gamma.
+
+## Known bug: black picture with Turnip on Android
+
+With the custom Turnip driver from Skate's `driver/` folder (Mesa, API 1.4.328) Trials Fusion plays sound and presents
+about 60 frames a second, all black, with the same draws as on PC. Without a `driver/` folder it shows. Cause unknown; it
+is not FXAA, `present_upscale_resolution`, the asynchronous pipelines or the Adreno settings in `android-overrides.toml`.
 
 ## Expected trouble
 

@@ -16,7 +16,7 @@ One APK per game. Each game runs on its own: the launcher is a desktop program.
 
 A controller is needed: there are no touch controls.
 
-Custom GPU driver (optional): unzip a driver package for Adreno (Turnip, or a newer Qualcomm driver, as made for
+Custom GPU driver (optional, and not for now: Trials Fusion stays black with Turnip, see `docs/linux_android.md`): unzip a driver package for Adreno (Turnip, or a newer Qualcomm driver, as made for
 AdrenoTools: `meta.json` and the driver `.so`) into `<game>/driver/`. The outcome is written to
 `<game>/driver_status.txt`. Remove the folder to go back to the system driver.
 

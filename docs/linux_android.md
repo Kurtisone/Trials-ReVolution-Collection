@@ -89,12 +89,19 @@ memory with `gpu_force_msaa_1x`.
 
 ## Known bug: no 3D scene in tracks on the Odin 2 Portal
 
-With the Qualcomm driver the first track shows the HUD over a black scene, so the game runs and only the 3D picture is
-missing. The same track renders on Linux with AMD. Still black, one setting off at a time: `vulkan_direct_resolve_fast32`,
-`vulkan_storage_image_texture_loads`, `gpu_force_msaa_1x`, `vulkan_hoist_shared_memory_uploads`,
-`vulkan_submit_on_primary_buffer_end`, and with FXAA back on. Without `vulkan_uncompressed_textures` the game died before
-the track, which settles nothing. Next: bypass the colour table lookup of the final pass (`BD6D432E414F4E49`), the step
-that sits between the scene and the HUD.
+With the Qualcomm driver the first track shows the HUD over a black scene. Same build and settings render on Linux with AMD,
+so it is the driver or the GPU, not a setting. About 2,500 to 3,400 draws a frame there.
+
+What is proven: the final pass (`BD6D432E414F4E49`) looks colours up in `tf5`, a 32x32x16 stacked k_8_8_8_8 table, and that
+table reads as black from the GPU: a fixed lookup at (0.5, 0.5, layer 8) gives (51, 89, 55) on PC and (0, 0, 0) on the Odin.
+Bypassing the lookup shows the scene is there, a flat silhouette with `readback_resolve = full` and almost nothing with
+`fast`, so the fast readback is a second problem on this device.
+
+Ruled out: the shader constants (identical to PC: c0, c251 to c255), asynchronous pipelines (no placeholder draws, and black
+with them off), and the settings `vulkan_direct_resolve_fast32`, `vulkan_storage_image_texture_loads`, `gpu_force_msaa_1x`,
+`vulkan_hoist_shared_memory_uploads`, `vulkan_submit_on_primary_buffer_end`, FXAA. Still open: whether pixel shader
+`3EBCA95DEB27B0CD`, which draws the table from its pixel position, outputs black on Adreno, or its resolve or the load
+of the 16 layer array loses it. Bypassing its 3D lookup does not help, so its input position and arithmetic come first.
 
 A track can be reached without touching the device: `mnk_mode = true`, `keybind_a = 'Space'`, `keybind_start = 'Return'`,
 then `adb shell input keyevent --longpress` with 66 (Return) and 62 (Space).

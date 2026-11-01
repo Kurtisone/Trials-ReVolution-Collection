@@ -54,7 +54,7 @@ extern const size_t g_nativeContainerCount;
 REXCVAR_DEFINE_BOOL(native_gpu_render, false, "GPU",
                     "Render with the native renderer, fed from the command stream");
 REXCVAR_DEFINE_BOOL(native_gpu_present, true, "GPU", "Show the native renderer's frames");
-REXCVAR_DEFINE_BOOL(native_gpu_present_early, true, "GPU",
+REXCVAR_DEFINE_BOOL(native_gpu_present_early, false, "GPU",
                     "Show a frame as soon as the GPU has finished it");
 REXCVAR_DEFINE_INT32(native_gpu_stats_seconds, 5, "GPU", "Log the native renderer's rate (0 = off)");
 REXCVAR_DEFINE_STRING(native_gpu_dump_addresses, "", "GPU",
@@ -366,13 +366,19 @@ void WaitEarlyPresent() {
 
 void RenderFrame(Frame& frame) {
   const auto start = std::chrono::steady_clock::now();
+  static uint32_t rendered_frames = 0;
+  const bool chatty = ++rendered_frames <= 6;
+  if (chatty) REXLOG_INFO("native_gpu: frame {} begins, {} calls", rendered_frames, frame.calls.size());
   uint32_t gamma_ramp[256];
   if (g_get_gamma_ramp && g_get_gamma_ramp(gamma_ramp)) g_renderer->SetGammaRamp(gamma_ramp);
   g_renderer->BeginFrame();
   RenderDeferredCalls(frame);
+  if (chatty) REXLOG_INFO("native_gpu: frame {} recorded", rendered_frames);
   // The last frame's pixels go with this EndFrame.
   WaitEarlyPresent();
+  if (chatty) REXLOG_INFO("native_gpu: frame {} early present done", rendered_frames);
   g_renderer->EndFrame(g_present ? frame.front_buffer : 0);
+  if (chatty) REXLOG_INFO("native_gpu: frame {} submitted", rendered_frames);
   const auto copy_start = std::chrono::steady_clock::now();
   if (g_present && REXCVAR_GET(native_gpu_present_early)) {
     static const bool started = [] {
@@ -701,6 +707,7 @@ void OnSwap(const rex::graphics::NativeCommandEvent& event) {
   }
   const size_t recorded_calls = g_recording.calls.size();
   const size_t recorded_bytes = g_recording.arena.size();
+  if (g_frame_number <= 6) REXLOG_INFO("native_gpu: swap {} queued, {} calls", g_frame_number, recorded_calls);
   {
     std::unique_lock<std::mutex> lock(g_queue_mutex);
     g_queue_cv.wait(lock, [] { return !g_queued.has_value(); });
@@ -750,7 +757,7 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   static bool tracing = false;
   if (event.kind == Kind::kDraw) ++draws_this_frame;
   if (event.kind == Kind::kSwap) {
-    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 400 && traced++ == 300;
+    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 150 && traced++ == 60;
     draws_this_frame = 0;
     g_trace_index = tracing ? 1 : 0;
   }

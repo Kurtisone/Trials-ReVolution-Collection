@@ -1,7 +1,46 @@
 # Native renderer for Trials Fusion
 
-The aim, as in Skate1Native: no Xenos emulation. Skate takes the game's D3D calls; Fusion has to use its command stream (see below). Not started in code. This is
-what was measured on `default.xex` 0.0.0.3 before writing any.
+The aim, as in Skate1Native: no Xenos emulation. Skate takes the game's D3D calls; Fusion has to use its command stream (see below). The first part of this
+file is the current state; the rest is what was measured on `default.xex` 0.0.0.3 before writing any.
+
+## Current state
+
+Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qualcomm's driver fails every pipeline with
+`VK_ERROR_UNKNOWN` although all the SPIR-V validates.
+
+* Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
+* First track: reached, 45 to 67 FPS. Geometry shows in depth and normals, base colours are black, so the lighting buffer
+  is zero, exposure is zero and the picture is white. **These figures are not the game's speed**: lighting and virtual
+  textures do not work yet.
+
+How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
+and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so
+the renderer stays close to Skate's. Draws whose shader has no native form go on to the plugin.
+
+Shaders: run with `gpu_shader_dump_dir`, then `tools/native/build_shaders.sh <dump>`. `make_containers.py` wraps raw microcode in
+the D3DX containers XenosRecomp reads. XenosRecomp needs `tools/native/xenosrecomp.patch`: all 256 pixel constants, loop
+counts per draw, and r0 as the vertex index, which Fusion's shaders use directly (terrain, full screen triangles).
+
+Surfaces marked 4x are drawn at 1x with viewport and pitch doubled. Resolves of 256 KB or less go back to guest memory a frame
+or two later, for the exposure and page request readers.
+
+To see a frame: `native_gpu_trace_frame = -1` logs a track frame and `native_gpu_dump_path` writes each resolve in order.
+
+What is left, in order:
+
+1. Base colours. Prime suspect: the page table is written by memory export, which stays in the plugin's GPU memory.
+   `readback_memexport_fast = true` freezes on the native path; the slow path runs but did not fix the picture, and
+   whether the table reaches guest memory is unmeasured (`TRACETEX` in the trace was written for that).
+2. Rect lists (primitive 8) are skipped.
+3. Frame pacing: nothing limits the rate, menus run at 700 FPS and that upsets driving the game by keys.
+4. Early present: races on the fence at high frame rates, off by default.
+5. Pixel position in 4x draws is not halved here as it was in the plugin test.
+6. Destination offsets of resolves in the shadow atlas, surface reinterpretation between formats.
+7. A shader cache for the whole game: 93 shaders from one track so far, unknown ones draw nothing.
+8. Qualcomm's driver, or shipping with Turnip.
+
+The earlier verdict below assumed the same shaders. Skate goes from 20 to 60 FPS on the Deck with XenosRecomp's, so that
+ceiling of about 40 FPS may be low; only a working track will tell.
 
 ## Shaders
 

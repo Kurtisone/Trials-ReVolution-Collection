@@ -84,7 +84,20 @@ reloads its 2048x2048 virtual texture table all the time, with 8 mip levels, and
 `vulkan_uncompressed_textures` creates textures mutable, which turns that compression off: the title screen went to 84
 FPS (12 ms a frame). `vulkan_storage_image_texture_loads` also writes the front buffer and movie planes without a copy.
 
-Measured on the title screen only. Tracks have not been measured with this.
+On the first track it runs at about 22 FPS, limited by the GPU thread (45 to 50 ms a frame), and no longer runs out of
+memory with `gpu_force_msaa_1x`.
+
+## Known bug: no 3D scene in tracks on the Odin 2 Portal
+
+With the Qualcomm driver the first track shows the HUD over a black scene, so the game runs and only the 3D picture is
+missing. The same track renders on Linux with AMD. Still black, one setting off at a time: `vulkan_direct_resolve_fast32`,
+`vulkan_storage_image_texture_loads`, `gpu_force_msaa_1x`, `vulkan_hoist_shared_memory_uploads`,
+`vulkan_submit_on_primary_buffer_end`, and with FXAA back on. Without `vulkan_uncompressed_textures` the game died before
+the track, which settles nothing. Next: bypass the colour table lookup of the final pass (`BD6D432E414F4E49`), the step
+that sits between the scene and the HUD.
+
+A track can be reached without touching the device: `mnk_mode = true`, `keybind_a = 'Space'`, `keybind_start = 'Return'`,
+then `adb shell input keyevent --longpress` with 66 (Return) and 62 (Space).
 
 ## Expected trouble
 

@@ -46,13 +46,15 @@
  std::atomic<NativeGuestOutputRenderer> g_renderer{nullptr};
  std::atomic<void*> g_renderer_user_data{nullptr};
  // True while the registered renderer actually replaced the last presented
-@@ -215,6 +217,18 @@
+@@ -215,6 +217,20 @@
    }
  }
  
 +void SetNativeCommandSink(NativeCommandSink sink, void* user_data) {
 +  g_command_sink_user_data.store(user_data);
 +  g_command_sink.store(sink);
++  // Memory exports must reach guest memory: the renderer reads textures from there.
++  if (sink) rex::cvar::SetFlagByName("readback_memexport", "true");
 +}
 +
 +bool HasNativeCommandSink() { return g_command_sink.load() != nullptr; }

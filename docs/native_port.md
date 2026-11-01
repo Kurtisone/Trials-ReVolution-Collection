@@ -30,34 +30,37 @@ Traced on the first track at 20 FPS, by function. "Sure" means the arguments fit
 
 | Function | Calls per frame | What | Confidence |
 | --- | --- | --- | --- |
-| `82228DB0` | 1,400 | DrawIndexedVertices: device, 4 (triangle list), base vertex, start index, index count | sure |
-| `822294B0` | 1,400 | SetIndices, device in r3; best match of Skate's `82CB95A8` | likely |
-| `8222FDF8` | not traced in numbers yet | DrawVertices, best match of Skate's `82CB3500` | guess |
-| `82221AB0` | | SetVertexShader, best match of Skate's `82CBE2E8` | guess |
-| `822230D8` | | SetTexture, best match of Skate's `82CCB4D0` | guess |
-| `82229228`, `8222DA80`, `822287C8` | 1,400, 940, 940 | Engine's draw submission, callers of the above | seen |
+| `82228DB0` | 1,394 | DrawIndexedVertices: device, 4 (triangle list), base vertex, start index, index count; holds the draw packets | sure |
+| `8222FDF8` | 51 | DrawVertices: device, primitive type, start, count; holds the draw packets | sure |
+| `822294B0` | 1,396 | SetIndices | likely |
+| `82226160` | 58 | Resolve, best match of Skate's `82CC7FF0`, holds a draw packet | likely |
+| `8220DD40` | 4 | ClearF, best match of Skate's `82CC7510` | likely |
+| `82221AB0` | 150 | SetVertexShader, best match of Skate's `82CBE2E8` | guess |
+| `826C91A0` | not traced | SetPixelShader, best match of Skate's `82CBDFE8` | guess |
+| `826DA710` | 1 | SetPredication, best match of Skate's `82CC4E78` | likely |
+| `82229228`, `8222DA80`, `822287C8` | 1,382, 940, 937 | Engine's draw submission, callers of the above | seen |
 | `826CB7B8` | 1 | Swap, device `40852A00`, front buffer `1F830000` in a callee | sure |
 | `826C3270` | 1 | Interrupt callback | sure |
 | `826C2780` | 2 million+ | Spin wait of the Render thread (caller `8225B138`) | seen |
 
 So draws go through D3D as in Skate, and hooking them is possible. An earlier version of this file said the opposite: it
-had traced only the `826C` part.
+had traced only the `826C` part. `BeginTiling` has no match.
 
-The frame's commands: 4 segments of about 16,000 words at `1FAF0000` to `1FB30000`, written on the Render thread by
-`82228DB0` and `8222DA80`, plus 42 small buffers replayed from `1FC93000` and `1FC94980`.
+Draw packet headers have the predicate bit set here (`C0032201`, `C0012201`, `C0003601`), which an early scan for them
+missed. Other functions holding them: `822272B8`, `82208F18`, `826C2E00`, `826DA130`, `826D6698`.
 
-The segments run 2 or 3 times in a frame (`1FB0` to `1FB2` twice, `1FB3` three times, `1FAF` once), the way D3D replays a
-scene for each tile with predicated tiling, as in Skate. The small buffers come in 14 groups of 24 `DRAW_INDX_2`, 336 draws.
-So 1,400 draws, about twice, plus 336, gives the 2,500 to 3,400 the GPU counts: no draws are missing. The tile functions
-are not named yet. This reading comes from one frame's buffer list. Hardware watchpoints on the small buffers, set from
-the menu through track loading, caught no writes, so they are written earlier or through another view.
+The frame's commands: one run of about 12 segments, each executed once: 4 long ones of about 16,000 words and shorter ones,
+in a ring from `1FA90000` to `1FC90000`, written on the Render thread by `82228DB0` and `8222DA80`, with 42 small buffers from
+`1FC93000` and `1FC94980` in between. There is no replay and no sign of predicated tiling, so Skate's single tile shortcut
+does not apply. An earlier version of this file claimed a replay: it had grouped buffers by address prefix.
 
-That replay is also a cost on the emulated path. In Skate, forcing the scene out of tiling cut draws from 2,060 to 800 a
-frame (`src/scene_tiling.cpp` there). `gpu_force_msaa_1x` does not do this.
+The small buffers come in 14 groups of 24 `DRAW_INDX_2`, 336 draws. Known draws add up to about 1,840 a frame against the
+2,500 to 3,400 the GPU counted, on other frames and on the Odin. That gap is not explained yet. Hardware watchpoints on the
+small buffers, set from the menu through track loading, caught no writes.
 
 ## Order of work
 
-1. Name the rest of the state functions around `82220000` to `82230000`, and the tile functions.
+1. Name the remaining state functions around `82220000` to `82230000`, and explain the gap in the draw count.
 2. Shaders: the raw microcode, for the whole set, through the SDK's translator.
 3. Render the title screen from a frame capture.
 4. Memory export: the deciding step, without which tracks have no textures.

@@ -77,6 +77,15 @@ With the custom Turnip driver from Skate's `driver/` folder (Mesa, API 1.4.328) 
 about 60 frames a second, all black, with the same draws as on PC. Without a `driver/` folder it shows. Cause unknown; it
 is not FXAA, `present_upscale_resolution`, the asynchronous pipelines or the Adreno settings in `android-overrides.toml`.
 
+## Frame rate on the Odin 2 Portal
+
+With the Qualcomm driver the intro runs at 6 FPS (165 ms a frame), at 720p as at 1440p. Measured with simpleperf (the APK
+is profilable): the GPU Commands thread spends 92% of its time in the kernel, 72% of it under `vkCmdCopyBufferToImage`,
+where the driver allocates memory for each copy (`gsl_memory_alloc`, `kgsl_sharedmem_alloc`). Render and SDLThread only
+wait for it. Turnip has no such cost (that thread drops to 15%) but gives black frames. Ways out: find what Turnip does
+wrong, or extend `vulkan_storage_image_texture_loads` (scaled 32 bpp textures only so far) to the textures in question.
+Whether this costs anything outside movies has not been measured.
+
 ## Expected trouble
 
 * **Trials Evolution on Android**: its title screen and far shadows need render targets emulated exactly. Linux uses

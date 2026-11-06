@@ -278,6 +278,8 @@ struct Frame {
   std::vector<uint8_t> arena;
   uint32_t front_buffer = 0;
   bool dump = false;
+  bool sync = false;  // read back to guest memory before the game goes on
+  bool resolves = false;  // holds resolves the game's memory exports may read
   std::vector<uint32_t> dump_addresses;
 };
 Frame g_recording;
@@ -479,6 +481,7 @@ void RendererThread() {
       g_busy = true;
     }
     RenderFrame(frame);
+    if (frame.sync) g_renderer->WaitIdle();
     static uint32_t rendered = 0;
     if (++rendered % 300 == 0) LogRendererIssues();
     {
@@ -566,8 +569,24 @@ size_t SnapshotState(const uint32_t* regs) {
 
 struct KnownShader {
   uint64_t key = 0;  // 0: not in the shader cache
+  bool memexport = false;
   std::vector<uint8_t> big_endian;
 };
+
+// True when the microcode allocates memory export (alloc type 3 among its control flow
+// instructions, which come before the first clause they execute).
+bool WritesMemory(const uint32_t* ucode, uint32_t dwords) {
+  uint32_t limit = dwords / 3 * 2;
+  for (uint32_t i = 0; i < limit; ++i) {
+    const uint32_t* triple = ucode + i / 2 * 3;
+    const uint32_t word0 = i % 2 ? triple[1] >> 16 | triple[2] << 16 : triple[0];
+    const uint32_t word1 = i % 2 ? triple[2] >> 16 : triple[1] & 0xFFFF;
+    const uint32_t opcode = word1 >> 12;
+    if (opcode == 12 && ((word1 >> 9) & 3) == 3) return true;
+    if (opcode >= 1 && opcode <= 7) limit = std::min(limit, (word0 & 0x1FF) * 2);
+  }
+  return false;
+}
 std::unordered_map<uint64_t, KnownShader> g_shaders;
 std::mutex g_container_mutex;
 std::unordered_map<uint64_t, const uint8_t*> g_containers;
@@ -578,6 +597,7 @@ const KnownShader& FindShader(uint64_t hash, const uint32_t* ucode, uint32_t dwo
     KnownShader& shader = it->second;
     shader.big_endian.resize(dwords * 4);
     for (uint32_t i = 0; i < dwords; ++i) StoreBE32(&shader.big_endian[i * 4], ucode[i]);
+    shader.memexport = WritesMemory(ucode, dwords);
     const uint64_t key = XXH3_64bits(shader.big_endian.data(), shader.big_endian.size());
     const ShaderCacheEntry* begin = g_shaderCacheEntries;
     const ShaderCacheEntry* end = begin + g_shaderCacheEntryCount;
@@ -602,19 +622,34 @@ const uint8_t* FindContainer(uint64_t key) {
   return it == g_containers.end() ? nullptr : it->second;
 }
 
+// Memory export draws run on the plugin, which reads their inputs from guest memory: what the
+// renderer resolved so far has to be there first, so the frame so far is rendered and read back.
+void SyncRenderer() {
+  if (!g_recording.resolves) return;
+  Frame frame = std::move(g_recording);
+  g_recording = Frame{};
+  frame.sync = true;
+  std::unique_lock<std::mutex> lock(g_queue_mutex);
+  g_queue_cv.wait(lock, [] { return !g_queued.has_value(); });
+  g_queued = std::move(frame);
+  g_queue_cv.notify_all();
+  g_queue_cv.wait(lock, [] { return !g_queued.has_value() && !g_busy; });
+}
+
 uint32_t g_trace_index = 0;
 bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   if (!event.vs_ucode) return true;
   const KnownShader& vertex = FindShader(event.vs_hash, event.vs_ucode, event.vs_dwords);
+  const KnownShader* pixel = event.ps_ucode ? &FindShader(event.ps_hash, event.ps_ucode, event.ps_dwords) : nullptr;
   // Memory export draws have no native form: the plugin runs them.
-  if (!vertex.key) return false;
+  if (vertex.memexport || (pixel && pixel->memexport)) {
+    SyncRenderer();
+    return false;
+  }
+  if (!vertex.key || (pixel && !pixel->key)) return false;
   native_gpu::DrawCall call;
   call.vs_key = vertex.key;
-  if (event.ps_ucode) {
-    const KnownShader& pixel = FindShader(event.ps_hash, event.ps_ucode, event.ps_dwords);
-    if (!pixel.key) return false;
-    call.ps_key = pixel.key;
-  }
+  if (pixel) call.ps_key = pixel->key;
   call.vs_physical = vertex.big_endian.data();
   call.vs_physical_size = uint32_t(vertex.big_endian.size());
   call.primitive = event.primitive;
@@ -672,6 +707,7 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
     if (call.trace_index) g_recording.dump = true;
     DeferredCall deferred{DeferredCall::Kind::kResolve, state, {}, {}, call};
     g_recording.calls.push_back(deferred);
+    g_recording.resolves = true;
   }
   if (color_clear || depth_clear) {
     native_gpu::ClearCall call;

@@ -414,6 +414,17 @@ void Renderer::WaitFrame(Frame& frame) {
         const uint8_t* host = data + (size_t(y) * entry.width + x) * entry.host_bytes;
         if (entry.target.format == 2 && entry.host_bytes == 4) {
           texel[0] = host[entry.target.swap_red_blue ? 0 : 2];
+        } else if (entry.target.format == 3 && entry.host_bytes == 8) {
+          // The page table: half floats holding the source bytes as integers, written as 1_5_5_5.
+          const auto channel = [&](uint32_t c) {
+            const uint16_t h = uint16_t(host[2 * c] | host[2 * c + 1] << 8);
+            const uint32_t exponent = (h >> 10) & 31;
+            return exponent ? uint32_t((1024 | (h & 1023)) << exponent >> 25) : 0u;
+          };
+          const uint32_t red = channel(entry.target.swap_red_blue ? 2 : 0), blue = channel(entry.target.swap_red_blue ? 0 : 2);
+          const uint16_t value = uint16_t((channel(3) & 1) << 15 | (red & 31) << 10 | (channel(1) & 31) << 5 | (blue & 31));
+          if (!value) continue;
+          std::memcpy(texel, &value, 2);
         } else if (entry.target.format == 3 && entry.host_bytes == 4) {
           // 8_8_8_8 in memory order (blue first) to 1_5_5_5.
           const uint32_t red = host[entry.target.swap_red_blue ? 0 : 2], blue = host[entry.target.swap_red_blue ? 2 : 0];
@@ -1576,7 +1587,7 @@ void Renderer::Resolve(const ResolveCall& call) {
     // Only what this resolve wrote: tables are updated a few pages at a time.
     const uint32_t rectWidth2 = uint32_t(std::max(rect[2] - rect[0], 0));
     const uint32_t rectHeight2 = uint32_t(std::max(rect[3] - rect[1], 0));
-    if (guestBytes && guestFormat != 3 && rectWidth2 && rectHeight2 &&
+    if (guestBytes && rectWidth2 && rectHeight2 &&
         uint64_t(rectWidth2) * rectHeight2 * guestBytes <= 256 * 1024) {
       ReadBackTarget target{guestBytes, destPitch, info & 7};
       target.x = uint32_t(x);

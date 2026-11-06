@@ -191,6 +191,10 @@ class Renderer {
     // their heap indices.
     std::unordered_map<uint32_t, std::pair<std::unique_ptr<plume::RenderTextureView>, uint32_t>>
         swizzled_views;
+    // Resolved textures fetched as a stack of layers by a 3D fetch: the volume they are copied to.
+    std::unique_ptr<plume::RenderTexture> volume;
+    std::unique_ptr<plume::RenderTextureView> volume_view;
+    uint32_t volume_index = 0, layers = 0;
     uint32_t resolved_size = 0;  // the guest memory a resolve writes
     uint64_t content_hash = 0;   // guest textures, NATIVE_GPU_VERIFY_TEXTURES
     uint32_t watch_stamp = 0;    // guest and resolved textures: WriteWatcher::Watch's
@@ -198,6 +202,8 @@ class Renderer {
   uint32_t ResolvedIndex(Texture& texture, uint32_t swizzle);
   // Releases a resolved texture once the recording frame has completed.
   void RetireResolved(Texture& texture);
+  void RetireVolume(Texture& texture);
+  void RefreshVolume(Texture& texture);
 
   Shader* GetShader(uint64_t key);
   Texture* GetGuestTexture(const xenos::TextureFetch& fetch);

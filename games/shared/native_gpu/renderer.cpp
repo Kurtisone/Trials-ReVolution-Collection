@@ -1316,6 +1316,41 @@ void Renderer::RetireResolved(Texture& dest) {
   retired_textures_.push_back(std::move(dest.texture));
   retired_views_.push_back(std::move(dest.view));
   for (auto& [swizzle, entry] : dest.swizzled_views) retired_views_.push_back(std::move(entry.first));
+  RetireVolume(dest);
+}
+
+void Renderer::RetireVolume(Texture& dest) {
+  if (!dest.volume) return;
+  layouts_.erase(dest.volume.get());
+  retired_textures_.push_back(std::move(dest.volume));
+  retired_views_.push_back(std::move(dest.volume_view));
+}
+
+// A resolve fetched as a stack of 2D layers by a 3D fetch (the colour grading LUT: 16 layers of
+// 32x32 side by side) is kept as a volume, copied again after each resolve.
+void Renderer::RefreshVolume(Texture& dest) {
+  const uint32_t width = dest.width / dest.layers;
+  if (!dest.volume) {
+    dest.volume = device_->createTexture(RenderTextureDesc::Texture3D(width, dest.height, dest.layers, 1, dest.format));
+    RenderTextureViewDesc view;
+    view.format = dest.format;
+    view.dimension = RenderTextureViewDimension::TEXTURE_3D;
+    view.mipLevels = 1;
+    dest.volume_view = dest.volume->createTextureView(view);
+    if (!dest.volume_index) dest.volume_index = AllocateSlot(2);
+    texture_3d_set_->setTexture(dest.volume_index, dest.volume.get(), RenderTextureLayout::SHADER_READ,
+                                dest.volume_view.get());
+    ++texture_generation_;
+  }
+  Transition(dest.texture.get(), RenderTextureLayout::COPY_SOURCE);
+  Transition(dest.volume.get(), RenderTextureLayout::COPY_DEST);
+  for (uint32_t layer = 0; layer < dest.layers; ++layer) {
+    const RenderBox box(int32_t(layer * width), 0, int32_t((layer + 1) * width), int32_t(dest.height));
+    commands_->copyTextureRegion(RenderTextureCopyLocation::Subresource(dest.volume.get(), 0, 0),
+                                 RenderTextureCopyLocation::Subresource(dest.texture.get(), 0, 0), 0, 0, layer, &box);
+  }
+  Transition(dest.volume.get(), RenderTextureLayout::SHADER_READ);
+  Transition(dest.texture.get(), RenderTextureLayout::SHADER_READ);
 }
 
 // A resolve into the virtual texture table: finds the level and block its address means and
@@ -1492,6 +1527,7 @@ void Renderer::Resolve(const ResolveCall& call) {
   commands_->setScissors(&scissor, 1);
   commands_->drawInstanced(3, 1, 0, 0);
   Transition(dest.texture.get(), RenderTextureLayout::SHADER_READ);
+  if (dest.layers) RefreshVolume(dest);
   ++stats_[depth ? "resolves (depth)" : "resolves (color)"];
   if (call.trace_index) {
     TraceDump dump;
@@ -1725,9 +1761,12 @@ void Renderer::Draw(const DrawCall& call) {
     if (fetch.format == xenos::k_10_11_11 && !raw) {
       narrowed[slot].emplace_back(uint32_t(fetch.offset * 4), uint32_t(fetch.is_signed));
     }
-    if (fetch.format == xenos::k_16_16 || fetch.format == xenos::k_16_16_FLOAT) {
+    // Swapped only where D3D patched the fetch: the container's swizzle then reads the pairs in natural
+    // order. One that already holds the patched swizzle (yxw) reads them as the 32-bit swap leaves them.
+    const bool natural = (xenos::LoadBE32(microcode + at + 4) & 0xFFF) != element.dst_swizzle;
+    if (natural && (fetch.format == xenos::k_16_16 || fetch.format == xenos::k_16_16_FLOAT)) {
       halfSwaps[slot].emplace_back(uint32_t(fetch.offset * 4), 1);
-    } else if (fetch.format == xenos::k_16_16_16_16 || fetch.format == xenos::k_16_16_16_16_FLOAT) {
+    } else if (natural && (fetch.format == xenos::k_16_16_16_16 || fetch.format == xenos::k_16_16_16_16_FLOAT)) {
       halfSwaps[slot].emplace_back(uint32_t(fetch.offset * 4), 2);
     }
     inputElements.emplace_back("", 0, uint32_t(location), format, slot, uint32_t(fetch.offset * 4));
@@ -1921,6 +1960,17 @@ void Renderer::Draw(const DrawCall& call) {
     }
     if (resolved != resolved_.end()) {
       shared.texture2DIndices[slot] = ResolvedIndex(resolved->second, t.swizzle);
+      // A stack of 2D layers (size field bits 26+) that the shader fetches as a volume.
+      const uint32_t layers = (state.U32(xenos::device::kFetchConstants + 24 * slot + 8) >> 26) + 1;
+      Texture& stack = resolved->second;
+      if (t.dimension == 1 && layers > 1 && stack.width % layers == 0) {
+        if (stack.layers != layers || !stack.volume) {
+          stack.layers = layers;
+          RetireVolume(stack);
+          RefreshVolume(stack);
+        }
+        shared.texture3DIndices[slot] = stack.volume_index;
+      }
     } else if (Texture* texture = GetGuestTexture(t)) {
       (texture->dimension == 3   ? shared.textureCubeIndices
        : texture->dimension == 2 ? shared.texture3DIndices

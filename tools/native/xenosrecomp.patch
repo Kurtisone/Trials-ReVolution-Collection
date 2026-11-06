@@ -46,7 +46,18 @@
          break;
      case TextureDimension::TextureCube:
          out += ", cubeMapData";
-@@ -1191,7 +1216,7 @@
+@@ -348,6 +373,10 @@
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
++    // The fetch constant's exponent adjust (and the scale of integer formats), set per draw.
++    if (instr.opcode == FetchOpcode::TextureFetch)
++        print(" * g_TexExpScale({})", instr.constIndex & 15);
++
+     out += ";\n";
+ 
+     printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+@@ -1191,7 +1220,7 @@
  
      // Registers the code reads that no constant table entry covers (EA's
      // shaders use raw registers next to named constants): plain loads.
@@ -55,7 +66,7 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
-@@ -1357,10 +1382,10 @@
+@@ -1357,10 +1386,10 @@
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
  
@@ -67,7 +78,7 @@
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
-@@ -1439,6 +1464,15 @@
+@@ -1439,6 +1468,15 @@
  
      bool printedRegisters[32]{};
  
@@ -83,9 +94,13 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
-@@ -1485,12 +1519,11 @@
+@@ -1483,14 +1521,14 @@
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
-                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+-                out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++                // Guest pixels: draws to scaled surfaces are made at several host pixels to the pixel.
++                out += "float4(floor(iPos.xy * g_PosScale) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
              }
 -        #ifdef UNLEASHED_RECOMP
 -            else if (!isPixelShader && hasIndexCount && i == 0)
@@ -99,7 +114,7 @@
              else
              {
                  out += "0.0;\n";
-@@ -1500,6 +1533,7 @@
+@@ -1500,6 +1538,7 @@
  
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
@@ -109,7 +124,16 @@
      if (isPixelShader)
 --- a/shader_common.h
 +++ b/shader_common.h
-@@ -67,6 +67,29 @@
+@@ -32,6 +32,8 @@
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+ #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+ #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_PosScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288)
++#define g_TexExpScale(i)           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 296 + (i) * 4)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -67,6 +69,29 @@
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  

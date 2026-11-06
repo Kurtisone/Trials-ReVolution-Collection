@@ -4,6 +4,7 @@
 // fetches expect:
 //   mode 0: color * scale (a resolve converts the value to the destination
 //           format, which is the host texture's)
+//   mode 7/8: biased color truncated to an unsigned/signed integer (UNORM/SNORM bits)
 //   mode 3: 8_8_8_8 color in memory order (x = blue, as D3D's A8R8G8B8 copies
 //           lay it out; the game's fetches swizzle it back).
 //   mode 1: depth packed as D24S8 (depth << 8 | stencil) in an 8_8_8_8
@@ -54,6 +55,16 @@ float4 PSMain(float4 position : SV_Position) : SV_Target
     {
         // A 1_5_5_5 destination with an exponent of 8 holds the source bytes as integers.
         return min(round(value * 255.0), float4(31.0, 31.0, 31.0, 1.0));
+    }
+    if (g_Push.Mode == 7)
+    {
+        // Integer destination, unsigned: the biased value truncated, stored as UNORM bits.
+        return clamp(trunc(value * g_Push.Scale), 0.0, 65535.0) / 65535.0;
+    }
+    if (g_Push.Mode == 8)
+    {
+        // Integer destination, signed: truncated, stored as SNORM bits (the int16 itself).
+        return clamp(trunc(value * g_Push.Scale), -32767.0, 32767.0) / 32767.0;
     }
     return value * g_Push.Scale;
 }

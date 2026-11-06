@@ -447,9 +447,11 @@ inline uint32_t UntileTexture3D(const uint8_t* physical, const TextureFetch& t, 
     const uint32_t row = t.width * block.bytes;
     const uint32_t stride = ((std::max(t.pitch, t.width) + 31) & ~31u) * block.bytes;
     const uint8_t* source = physical + (t.address & 0x1FFFFFFF);
+    // Slices are padded to whole 32 row tiles.
+    const uint32_t slice_rows = (t.height + 31) & ~31u;
     for (uint32_t z = 0; z < t.depth; ++z) {
       for (uint32_t y = 0; y < t.height; ++y) {
-        std::memcpy(out + (size_t(z) * t.height + y) * row, source + (size_t(z) * t.height + y) * stride, row);
+        std::memcpy(out + (size_t(z) * t.height + y) * row, source + (size_t(z) * slice_rows + y) * stride, row);
       }
     }
     SwapEndian(out, size_t(row) * t.height * t.depth, t.endian);

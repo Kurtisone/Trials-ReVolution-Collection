@@ -73,7 +73,33 @@ struct SharedConstants {
   float alphaThreshold{};
   uint32_t loop16{};
   uint32_t loop17{};
+  uint32_t pad{};
+  // Guest pixels per host pixel, for the pixel position of shaders that read it.
+  float posScaleX{1.0f};
+  float posScaleY{1.0f};
+  // Fetch constant exponent adjust, and the range of integer formats the host holds normalized.
+  float texExpScale[16] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 };
+static_assert(offsetof(SharedConstants, posScaleX) == 288 && offsetof(SharedConstants, texExpScale) == 296);
+
+// The factor a fetch multiplies its result by: 2^exponent from fetch constant word 3, and for integer
+// formats (num_format 1) the full range, because the host texture is normalized.
+float TextureExpScale(const xenos::DeviceState& state, uint32_t slot) {
+  const uint32_t word0 = state.U32(xenos::device::kFetchConstants + 24 * slot);
+  if ((word0 & 3) != 2) return 1.0f;
+  const uint32_t word1 = state.U32(xenos::device::kFetchConstants + 24 * slot + 4);
+  const uint32_t word3 = state.U32(xenos::device::kFetchConstants + 24 * slot + 12);
+  float scale = std::ldexp(1.0f, int32_t(word3 << 13) >> 26);
+  if (word3 & 1) {
+    const bool is_signed = ((word0 >> 2) & 0xFF) == 0x55;
+    switch (word1 & 0x3F) {
+      case 6: scale *= is_signed ? 127.0f : 255.0f; break;
+      case 25: case 26: scale *= is_signed ? 32767.0f : 65535.0f; break;
+      default: break;
+    }
+  }
+  return scale;
+}
 
 struct ResolvePushConstants {
   uint32_t source_index;
@@ -516,7 +542,8 @@ void Renderer::BeginFrame() {
   commands_ = frame.commands.get();
   UseUploadBuffer(frame.upload.get(), kUploadSize);
   commands_->begin();
-  current_targets_ = {}; current_color1_ = nullptr;
+  current_targets_ = {};
+  current_color1_ = nullptr;
   main_layout_bound_ = false;
 }
 
@@ -1283,7 +1310,8 @@ void Renderer::RetireResolved(Texture& dest) {
       ++it;
     }
   }
-  if (current_targets_.first == dest.texture.get()) current_targets_ = {}; current_color1_ = nullptr;
+  if (current_targets_.first == dest.texture.get()) current_targets_ = {};
+  current_color1_ = nullptr;
   layouts_.erase(dest.texture.get());
   retired_textures_.push_back(std::move(dest.texture));
   retired_views_.push_back(std::move(dest.view));
@@ -1388,11 +1416,30 @@ void Renderer::Resolve(const ResolveCall& call) {
     } else {
       push.mode = 3;
     }
-  } else if (format == RenderFormat::R16G16_FLOAT) {
+  } else if (format == RenderFormat::R16G16_FLOAT || format == RenderFormat::R16G16B16A16_FLOAT) {
     // A resolve converts: the EDRAM value (fixed point, -32..32) is written
     // in the destination format, here the unsigned normalized 16_16 the
-    // game fetches it as (shadow depth and mask in 0..1).
-    format = RenderFormat::R16G16_UNORM;
+    // game fetches it as (shadow depth and mask in 0..1). With an integer
+    // number format the biased value is truncated to the integer itself
+    // (the occlusion pyramid is read back on the CPU as signed 16_16).
+    const uint32_t copyInfo = call.state.Reg(0x231B);
+    const uint32_t destFormat = (copyInfo >> 7) & 0x3F, number = (copyInfo >> 13) & 7;
+    const bool two = format == RenderFormat::R16G16_FLOAT;
+    if (destFormat == (two ? 25u : 26u) && (number == 2 || number == 3)) {
+      push.mode = number == 3 ? 8 : 7;
+      format = number == 3 ? (two ? RenderFormat::R16G16_SNORM : RenderFormat::R16G16B16A16_SNORM)
+                           : (two ? RenderFormat::R16G16_UNORM : RenderFormat::R16G16B16A16_UNORM);
+    } else if (two && destFormat != xenos::kTex_16_FLOAT && destFormat != xenos::kTex_16_16_FLOAT &&
+               destFormat != xenos::kTex_16_16_16_16_FLOAT) {
+      // Half float destinations (the exposure, read on the CPU as k_16_FLOAT) keep the float.
+      format = RenderFormat::R16G16_UNORM;
+    }
+  }
+  if (!depth) {
+    // RB_COPY_DEST_INFO exponent bias (signed, bits 16..21): the value is multiplied by 2^bias.
+    // Mode 5 applies its own.
+    const int32_t bias = int32_t(call.state.Reg(0x231B) << 10) >> 26;
+    if (push.mode != 5) push.scale = std::ldexp(1.0f, bias);
   }
 
   Texture& dest = resolved_[address];
@@ -1689,6 +1736,29 @@ void Renderer::Draw(const DrawCall& call) {
   vertexLayout.slot_layouts.resize(slotFetch.size());
   std::vector<RenderVertexBufferView>& vertexViews = vertex_views_;
   vertexViews.clear();
+  // Rectangle lists: the vertex of each corner, in draw order, whether the draw is indexed, inline or neither.
+  // Each rectangle is expanded on the CPU to two triangles below.
+  uint32_t rectCount = rects ? call.count / 3 : 0;
+  std::vector<uint32_t> rectVertices;
+  if (rects && call.indices_size) {
+    std::vector<uint8_t> guest(call.indices_size);
+    std::memcpy(guest.data(), physical_ + (call.indices_address & 0x1FFFFFFF), guest.size());
+    xenos::SwapEndian(guest.data(), guest.size(), call.indices_endian);
+    const uint32_t bytes = call.indices_32bit ? 4 : 2;
+    const uint32_t available = uint32_t(guest.size() / bytes);
+    rectCount = call.start >= available ? 0 : std::min(rectCount, (available - call.start) / 3);
+    for (uint32_t i = 0; i < rectCount * 3; ++i) {
+      uint32_t index = 0;
+      std::memcpy(&index, &guest[size_t(call.start + i) * bytes], bytes);
+      rectVertices.push_back(index + call.base_vertex);
+    }
+  } else if (rects) {
+    for (uint32_t i = 0; i < rectCount * 3; ++i) rectVertices.push_back((call.inline_vertices ? 0 : call.start) + i);
+  }
+  if (rects && !rectCount) {
+    ++stats_["draw skipped: empty rectangle list"];
+    return;
+  }
   for (uint32_t slot = 0; slot < slotFetch.size(); ++slot) {
     const xenos::VertexFetch fetch = xenos::DecodeVertexFetch(state, slotFetch[slot]);
     const uint32_t stride = inputSlots[slot].stride;
@@ -1728,7 +1798,7 @@ void Renderer::Draw(const DrawCall& call) {
         }
       }
     };
-    if (call.inline_vertices) {
+    if (call.inline_vertices && !rects) {
       // Inline vertices live in the command buffer: converted every time.
       convert_buffer_.assign(call.inline_vertices, call.inline_vertices + call.inline_size);
       convert(convert_buffer_.data(), call.inline_size, 2);
@@ -1745,13 +1815,20 @@ void Renderer::Draw(const DrawCall& call) {
       vertexLayout.slot_layouts[slot] = layout;
     }
     const uint32_t address = fetch.address & 0x1FFFFFFF;
-    if (rects && !call.indices_size && stride) {
+    if (rects && stride) {
       // Each rectangle becomes two triangles. The fourth corner is the sum of the two ends
       // of the diagonal, the longest side, less the third, in every float element.
-      const uint32_t rectCount = call.count / 3;
       const uint32_t size = rectCount * 3 * stride;
-      convert_buffer_.assign(physical_ + address + call.start * stride, physical_ + address + call.start * stride + size);
-      convert(convert_buffer_.data(), size, fetch.endian);
+      convert_buffer_.assign(size, 0);
+      for (uint32_t i = 0; i < rectCount * 3; ++i) {
+        const uint64_t at = uint64_t(rectVertices[i]) * stride;
+        if (call.inline_vertices) {
+          if (at + stride <= call.inline_size) std::memcpy(&convert_buffer_[size_t(i) * stride], call.inline_vertices + at, stride);
+        } else if (at + stride <= fetch.size) {
+          std::memcpy(&convert_buffer_[size_t(i) * stride], physical_ + address + at, stride);
+        }
+      }
+      convert(convert_buffer_.data(), size, call.inline_vertices ? 2 : fetch.endian);
       std::vector<uint8_t> expanded(size_t(rectCount) * 6 * stride);
       for (uint32_t r = 0; r < rectCount; ++r) {
         const uint8_t* v = convert_buffer_.data() + size_t(r) * 3 * stride;
@@ -1812,6 +1889,7 @@ void Renderer::Draw(const DrawCall& call) {
   for (uint32_t slot = 0; slot < 16; ++slot) {
     // A fetch constant already seen, with no texture changed since.
     const uint8_t* fetchConstant = state.data + xenos::device::kFetchConstants + 24 * slot;
+    shared.texExpScale[slot] = TextureExpScale(state, slot);
     uint32_t words[3];
     std::memcpy(words, fetchConstant, 12);
     SlotBinding& binding = bindings_[((words[0] * 2654435761u) ^ (words[1] * 40503u) ^ words[2]) >> 22];
@@ -1899,7 +1977,8 @@ void Renderer::Draw(const DrawCall& call) {
   // set), all seen through the flipped viewport plume is always clockwise for.
   const uint32_t cullBits = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 3;
   const bool frontClockwise = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4;
-  if (cullBits == 0 || cullBits == 3) {
+  // Rectangle lists are not culled: the corners come in any winding.
+  if (cullBits == 0 || cullBits == 3 || rects) {
     desc.cullMode = RenderCullMode::NONE;
   } else {
     desc.cullMode = (cullBits == 1) == frontClockwise ? RenderCullMode::FRONT : RenderCullMode::BACK;
@@ -1976,22 +2055,6 @@ void Renderer::Draw(const DrawCall& call) {
   const bool worldDraw = color.scale_x > color.scale && desc.depthEnabled &&
                          std::find(std::begin(kInterfaceVertexShaders), std::end(kInterfaceVertexShaders),
                                    call.vs_key) == std::end(kInterfaceVertexShaders);
-  const uint64_t vsConstants = uploadConstants(vs_constants_, state.data + xenos::device::kVertexConstants);
-  const uint64_t psConstants = uploadConstants(ps_constants_, state.data + xenos::device::kPixelConstants);
-  shared.booleans = (state.U32(xenos::device::kVertexBoolConstants) & 0xFF) |
-                    ((state.U32(xenos::device::kPixelBoolConstants) & 0xFF) << 16);
-  shared.alphaThreshold = state.RegF(xenos::reg::RB_ALPHA_REF);
-  shared.loop16 = state.U32(0x33F0);
-  shared.loop17 = state.U32(0x33F4);
-  const uint64_t sharedConstants = Allocate(&shared, sizeof(shared));
-  const uint64_t pushConstants[] = {upload_address_ + vsConstants, upload_address_ + psConstants,
-                                    upload_address_ + sharedConstants};
-
-  TrackEdram(state, color, depth, blend.renderTargetWriteMask != 0,
-             desc.depthWriteEnabled || (desc.stencilEnabled && desc.stencilWriteMask), ViewportBottom(state),
-             true);
-
-  // Viewport from the D3D viewport transform (the shaders invert Y).
   // The interface keeps its 16:9 shape, in the middle of a wider picture.
   bool interfaceDraw = std::find(std::begin(kInterfaceVertexShaders), std::end(kInterfaceVertexShaders),
                                  call.vs_key) != std::end(kInterfaceVertexShaders);
@@ -2010,6 +2073,25 @@ void Renderer::Draw(const DrawCall& call) {
     }
   }
   const float xScale = interfaceDraw ? color.scale : color.scale_x;
+  const float scaleXy = color.scale;
+  const uint64_t vsConstants = uploadConstants(vs_constants_, state.data + xenos::device::kVertexConstants);
+  const uint64_t psConstants = uploadConstants(ps_constants_, state.data + xenos::device::kPixelConstants);
+  shared.booleans = (state.U32(xenos::device::kVertexBoolConstants) & 0xFF) |
+                    ((state.U32(xenos::device::kPixelBoolConstants) & 0xFF) << 16);
+  shared.alphaThreshold = state.RegF(xenos::reg::RB_ALPHA_REF);
+  shared.loop16 = state.U32(0x33F0);
+  shared.loop17 = state.U32(0x33F4);
+  shared.posScaleX = 1.0f / xScale;
+  shared.posScaleY = 1.0f / scaleXy;
+  const uint64_t sharedConstants = Allocate(&shared, sizeof(shared));
+  const uint64_t pushConstants[] = {upload_address_ + vsConstants, upload_address_ + psConstants,
+                                    upload_address_ + sharedConstants};
+
+  TrackEdram(state, color, depth, blend.renderTargetWriteMask != 0,
+             desc.depthWriteEnabled || (desc.stencilEnabled && desc.stencilWriteMask), ViewportBottom(state),
+             true);
+
+  // Viewport from the D3D viewport transform (the shaders invert Y).
   // The spare width beside the 16:9 area. Over the 3D world, the interface's
   // sides follow the screen's sides: the transform in c4 gives the position on a 1280 wide screen.
   // (Menus stay together in the middle: without the world, or after a cover over it.)
@@ -2033,7 +2115,6 @@ void Renderer::Draw(const DrawCall& call) {
   // Direct3D 9 pixel centers (pix_center 0): half a pixel, or every full-screen
   // pass samples between texels and blurs the frame.
   const float half = (state.Reg(xenos::reg::PA_SU_VTX_CNTL) & 1) ? 0.0f : 0.5f;
-  const float scaleXy = color.scale;
   const float ox = state.RegF(xenos::reg::PA_CL_VPORT_XOFFSET) * xScale + xOffset + half;
   const float sy = state.RegF(xenos::reg::PA_CL_VPORT_YSCALE) * scaleXy;
   const float oy = state.RegF(xenos::reg::PA_CL_VPORT_YOFFSET) * scaleXy + half;
@@ -2076,7 +2157,7 @@ void Renderer::Draw(const DrawCall& call) {
   commands_->setGraphicsPushConstants(0, pushConstants);
   commands_->setVertexBuffers(0, vertexViews.data(), uint32_t(vertexViews.size()), inputSlots.data());
   if (rects) {
-    commands_->drawInstanced(call.count / 3 * 6, 1, 0, 0);
+    commands_->drawInstanced(rectCount * 6, 1, 0, 0);
   } else if (call.indices_size && quads) {
     // Each four indices make two triangles.
     std::vector<uint8_t> guest(call.indices_size);

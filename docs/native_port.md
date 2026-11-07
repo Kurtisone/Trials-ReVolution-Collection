@@ -9,9 +9,8 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, 51 FPS and 19 ms a frame on the renderer thread on RADV (Renoir). The lit buffer matches the emulated one
-  in ratio 1 to 1.5 where the terrain is not involved (HDR mean 0.13 against 0.21); the final picture is still 4 to 5 times
-  too dark (exposure, below) and the terrain lacks its pages.
+* First track: reached, 51 FPS and 19 ms a frame on the renderer thread on RADV (Renoir). The final picture is now about as
+  bright as the emulated one (mean 120 against 146 in luminance, same moment); the floor and the signboards still lack their pages.
 * Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
   95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
@@ -106,27 +105,45 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
      the lighting pass had no sun and ambient/point lights without shape. `ResolveCall::second_target` skips that check.
      (Claiming RT1's tiles in the draw path instead breaks the loading screen: its top half goes black.) The HDR mean went
      from 0.04 to 0.13.
-* Tools: the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
+* Exposure, fixed: the ramp 0, 1, 2 ... 15 was the shader, not data. PS 577E0310 is an if / else / endif chain on the predicate
+  stack (counter in r15.w), and the translation of `setp_inv` (the else) left the counter at 1 where the hardware sets 0
+  (`p0 = src == 1`, result 0 when it is 1, 1 when it is 0, else unchanged). So the nested `setp_gt_push` that follows could never
+  run, the adaptation (blend of the new luminance into the history at pixel c0.w, accepted when it falls outside what the
+  history holds) was skipped, and the output was `oC0 = r0.x`, the pixel index: each frame wrote its own index into the history.
+  Now the history starts at the CPU's 0.0189 and follows the scene (0.125 after 300 frames), c8.y / c8.x is in the emulated
+  range and the picture is as bright. Every shader with an else gains from it (xenosrecomp.patch). The k_16_FLOAT resolve and
+  `WaitFrame`'s copy were right.
+* Tools (also `tbl.py`: page table levels, emulated against native; `tblmask.py`: one level as a mask side by side; `tat.sh`: a
+  native run traced once N s after the track starts): the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
   resolve swaps red and blue. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
   its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
   numbered like the native dumps), so a same-moment pair is one `nav.py` run each with `NAV_TRACES`.
 
 Next, in order:
 
-1. Exposure: the final picture is 4 to 5 times darker than the emulated one although the lit buffer is about right. The
-   tonemap (PS BD6D432E414F4E49) scales by `c8.y / c8.x` of its pixel constants, from the CPU: 0.117 / 0.55 natively,
-   0.0585 / 0.1447 emulated (the other values of the draw, c0 to c2 and c252 to c255, are equal). The CPU reads the history
-   texture the exposure pass (PS 577E03101947F4E9, 16x1 `k_16_FLOAT` ring updated at the pixel `c0.w`, input the 1x1
-   log luminance from the pyramid) writes to guest memory. Natively that texture holds 0, 1, 2 ... 15 in the traced frame
-   (the emulated one 0.189 in 8 entries and luminance samples in the others, `TRACE guest` at its destination), and the
-   pass writes the same ramp back: the pixel for `c0.w` takes the path that keeps the old value. By hand, with a ramp
-   history the update is skipped unless the new value falls outside the history, so what to look at is where the ramp
-   comes from (initial guest memory, or an earlier pass of ours) and whether the predicate counter `r15.w` chain of the
-   translation is right (not checked against the hardware's predicate stack). The log luminance pyramid is of the right
-   kind (last level -0.9 to -2.8 natively, -0.1 to -3.7 emulated, scenes of different brightness).
-2. Page loading: native keeps requesting one page a frame where the emulated run stops after about 2,500; the atlases hold
-   3 % of their blocks 70 s into the track (emulated not measured). The floor and the sign boards stay dark and untextured.
-3. Frame rate: 51 FPS on the track, 19 ms a frame on the renderer thread (RADV, Renoir), aim 60. The EDRAM stale-tile clear
+1. Page table cascade: native keeps requesting about one page a frame (4,600 after 80 s) where the emulated run stops
+   after about 2,500, and the floor and signboards stay untextured. What is known (2026-11-07, `tat.sh`, `tbl.py`,
+   `tblmask.py`; guest memory addresses as in the traced frame):
+   * The page table (2048 wide, 1_5_5_5, 8 levels, `mip_max_level` 7) is not written by the CPU or by memory export. The
+     only seeds are PS 0D26ADDF point lists (12 to 26 points of one pixel, in the first frames; later 1 or 2 points every
+     ~14 s). Everything else is the cascade, each frame: 6398EA (copy of level c0.x, or with c0.w = 0.5 a block of the finer
+     level as the 2x enlargement of level c0.x at texel (c0.yz + pixel) / 2, `texLod` = c0.x) and 95BB84 (normalized coordinates,
+     level c0.x - c254.x, a quadrant of the viewport as the quad is half the clip space: a window of a finer level, scrolled by
+     the integer part of c0.yz * c254.y, over the copy). The emulated table fills to about 1,000,000 nonzero entries in 10
+     frames and then changes little (a count of the table's 11 MB in guest memory every 250 swaps); every 64x64, 128x128
+     and 256x256 block of levels 2 to 0 resolved in the steady frames is nonzero, natively they are zero from level 3 on
+     (dumps 5 and up of the traced frame), while the guest copy the CPU reads holds only 131,000 + 130,000 entries
+     (emulated 1,015,000). The CPU reads that guest table to decide which pages to load, so it asks again for what it believes
+     is missing.
+   * Fixed on the way: a fetch with `setTexLOD` past the last level (the seed frames draw 6398EA with c0.x = 8 over level 7)
+     asked `GetDimensions` for a level that does not exist, so the whole copy came out as zero; `tfetch2DLod` now clamps the
+     level to the last. With it the first cascade frame has the same entry counts per level as the emulated one (28, 112, 448,
+     1,792, 7,168), but 60 s into the track levels 7 to 4 hold more than the emulated ones (64, 256, 3,840, 15,360 against 42,
+     168, 672, 2,688) and level 3 and below are still empty; before the clamp levels 7 and 6 matched and 5 and 4 held 62 %.
+     So something else still differs in the steady frames: the quadrant draws (95BB84) of levels 5 to 3, which read windows
+     of levels 2 to 0, or the copy of a resolved block into the table (`CopyResolveToTable`). Not found. A point list's size
+     is not the cause: `PA_SU_POINT_SIZE` is 1 pixel there, as the emulated mask shows.
+2. Frame rate: 51 FPS on the track, 19 ms a frame on the renderer thread (RADV, Renoir), aim 60. The EDRAM stale-tile clear
    ran 155,000 times in one 110 s run ("EDRAM: color target overwritten by another surface").
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve

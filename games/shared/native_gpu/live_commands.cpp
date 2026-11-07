@@ -709,6 +709,12 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   call.vs_physical = vertex.big_endian.data();
   call.vs_physical_size = uint32_t(vertex.big_endian.size());
   call.primitive = event.primitive;
+  call.scissor_tl = event.registers[0x2081];  // PA_SC_WINDOW_SCISSOR_TL
+  call.scissor_br = event.registers[0x2082];
+  if (Surface4x(event.registers)) {
+    call.scissor_tl = DoublePair(call.scissor_tl, 0x80000000u);
+    call.scissor_br = DoublePair(call.scissor_br, 0x80000000u);
+  }
   call.count = event.count;
   AddExportRanges(vertex, event.registers + kRegFloatConstants, call);
   if (pixel) AddExportRanges(*pixel, event.registers + kRegFloatConstants + 256 * 4, call);
@@ -771,6 +777,7 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
     native_gpu::ClearCall call;
     call.flags = (color_clear ? 0xF : 0) | (depth_clear ? 0x30 : 0);
     call.has_rect = true;
+    call.raw_color = true;
     for (int i = 0; i < 4; ++i) call.rect[i] = rect[i] * scale;
     const uint32_t value = regs[0x231E];  // RB_COLOR_CLEAR, ARGB
     for (int c = 0; c < 4; ++c) call.color[c] = float((value >> ((c + 1) % 4 ? 24 - 8 * (c + 1) : 24)) & 0xFF) / 255.0f;
@@ -891,6 +898,29 @@ void TraceCommand(const rex::graphics::NativeCommandEvent& event, bool handled) 
   }
 }
 
+// What the emulated GPU left at the front buffer in guest memory (1024x608, 8_8_8_8, tiled), untiled,
+// for comparison with the native frame's dump. Needs the plugin's resolves read back to memory.
+void DumpGuestFrontBuffer(uint32_t address) {
+  constexpr uint32_t kWidth = 1024, kHeight = 608;
+  const uint8_t* source = g_memory->TranslatePhysical(address);
+  std::vector<uint8_t> rgba(kWidth * kHeight * 4);
+  for (uint32_t y = 0; y < kHeight; ++y) {
+    for (uint32_t x = 0; x < kWidth; ++x) {
+      const uint8_t* pixel = source + xenos::TiledOffset2D(int32_t(x), int32_t(y), kWidth, 2);
+      uint8_t* out = &rgba[(y * kWidth + x) * 4];
+      out[0] = pixel[3];  // the dwords hold A, R, G, B in memory order
+      out[1] = pixel[2];
+      out[2] = pixel[1];
+      out[3] = 0xFF;
+    }
+  }
+  const std::string path = fmt::format("{}.{:08X}_{}x{}_20.raw", REXCVAR_GET(native_gpu_dump_path), address, kWidth, kHeight);
+  if (FILE* f = std::fopen(path.c_str(), "wb")) {
+    std::fwrite(rgba.data(), 1, rgba.size(), f);
+    std::fclose(f);
+  }
+}
+
 bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   using Kind = rex::graphics::NativeCommandEvent::Kind;
   // The emulated GPU renders; the trace only looks, for a reference to compare with.
@@ -920,8 +950,13 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
     }
     static bool tracing = false;
     if (event.kind == Kind::kSwap) {
-      tracing = draws > 150 && heavy++ == 900;
+      // The same frame as the native trace's (native_gpu_trace_frame = -1); the front buffer on request.
+      tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws > 800 && heavy++ == 240;
       draws = 0;
+      std::error_code error;
+      if (std::filesystem::remove(REXCVAR_GET(native_gpu_dump_path) + ".trigger", error)) {
+        DumpGuestFrontBuffer(event.front_buffer & 0x1FFFFFFF);
+      }
     } else {
       draws += event.kind == Kind::kDraw;
       if (tracing) TraceCommand(event, false);

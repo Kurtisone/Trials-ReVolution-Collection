@@ -43,19 +43,29 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   1_5_5_5 words, and truncated 11 to 10; now the same words as the emulated run's for the common entries (42,000 of 1,048,576 differ, as pages move).
 * `getCompTexLOD` wrote its result to x whatever the destination swizzle; the feedback shaders read it in y.
 * Page draws (BCFF66D9 / 758C4BE0): emulated does about 2,300 in the 1,000 frames after its first 52, native stays at 50 to
-  120 over 7,000 frames, so the atlases stay at 35,000 to 150,000 blocks of 1,048,576. Not found why. The CPU decision is
-  not the feedback alone: the emulated and native runs reach different tracks with the same key script (emu_front.png is
-  a start line, the native run Greenhorn's Grove), so their feedback cannot be compared yet.
-* Albedo is not the black: with the first frames' pages present the albedo resolve is right and washed out (027 in a trace).
-  The black comes later: the shadow mask 40768DE1 resolves to (0, 0, 1, 0) at 14F42000 and 3743B184 adds the sun only where
-  that mask is above zero. Likely cause, not checked: the 512x2048 1_5_5_5 texture the shadow pass resolves a second time from
-  the same target (info 01000181, read by 40768DE1 as t3) is zero here. Not fixed.
+  120 over 7,000 frames. Not found why, and not compared yet with the same scene: the two modes can now reach the same
+  track (below), the feedback and page memory comparison is still to do.
+* Both modes reach Greenhorn's Grove from a script that waits for screens (scratchpad nav.py: coarse normalised
+  front-buffer signatures, Space only on a known menu screen). `native_gpu_observe` now takes the same trace frame as
+  the native run (`native_gpu_trace_frame = -1`: the 240th frame of 800+ draws) and writes the front buffer from guest
+  memory on `<dump>.trigger`. Guest allocations (so addresses) differ between runs and modes, compare by role.
+* Fixed, shadow side: the shadow mask atlas pass draws 8_8_8_8 stamps into EDRAM tiles that a 16_16 pass cleared;
+  those tiles hold the clear word (white), the native 8888 surface started at zero. Clears now leave their raw word per
+  tile and a surface taking over the tiles reads it. The 1_5_5_5 atlas is white like the emulated one. Resolves
+  landing in the middle of an earlier resolved texture (the atlas is resolved in 512-row bands at tile row offsets)
+  now go into that texture instead of a new one at their own address.
+* Fixed: the window scissor (PA_SC_WINDOW_SCISSOR) was ignored; the lighting pass (3743B184) draws a full-screen quad in 16
+  strips of 38 rows, each with its own lights and no blending, so each draw overwrote the screen.
+* Still black: with all of that the lighting pass (3743B184) writes about nothing (HDR mean 0.036, max 0.3, against 0.11 and
+  1.8 emulated), also with the stencil test off. Its pixel constants equal the emulated ones. The inputs (depth,
+  normals, albedo, mask, atlas) look right, so a fetch (cube maps t4 / t6, the DXT5A t8 / t14) or an instruction is
+  suspect; compare one pixel by hand or output intermediates.
 
 Next, in order:
 
-1. Page loading (above), with the same track in both runs.
-2. The shadow atlas: the 1_5_5_5 resolve of a 16_16 target (info 01000181, FE3B0FE3's pass, c0=000400E0 / 00000340).
-3. Frame rate: 41 FPS on the track, 23.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
+1. The lighting pass above (why it is dark).
+2. Page loading (above), with the same track in both runs.
+3. Frame rate: 48 FPS on the track, 20.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

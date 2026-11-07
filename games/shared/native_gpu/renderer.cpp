@@ -1413,7 +1413,7 @@ Renderer::Texture& Renderer::GetDepthSurface(const xenos::DeviceState& state) {
 }
 
 void Renderer::TrackEdram(const xenos::DeviceState& state, Texture& color, Texture& depth, bool colorWritten,
-                          bool depthWritten, uint32_t height, bool check) {
+                          bool depthWritten, uint32_t height, bool check, std::optional<uint32_t> clear) {
   const uint32_t surfaceInfo = state.Reg(xenos::reg::RB_SURFACE_INFO);
   // Draws in a row on the same targets: every tile is already theirs.
   const EdramUse use{&color, &depth, surfaceInfo, state.Reg(xenos::reg::RB_COLOR_INFO),
@@ -1445,25 +1445,30 @@ void Renderer::TrackEdram(const xenos::DeviceState& state, Texture& color, Textu
       // surface's last contents; passes that keep what is in EDRAM (Skate's
       // untiled scene path clears depth only, and foliage writes no alpha)
       // must not get an old frame. Clear them, as the tiled path does.
-      std::vector<RenderRect> stale;
+      // A clear's word read in this surface's format; anything else reads as zero.
+      std::map<uint32_t, std::vector<RenderRect>> stale;
       tiles(info & 0xFFF, wide, [&](uint32_t tile, uint32_t column, uint32_t row, uint32_t w, uint32_t h) {
         const Texture* owner = edram_owners_[tile];
         if (!owner || owner == &color || owner == &depth) return;
         const int32_t x = int32_t(column * w * color.scale_x), y = int32_t(row * h * color.scale);
         const int32_t right = int32_t((column + 1) * w * color.scale_x), bottom = int32_t((row + 1) * h * color.scale);
-        if (!stale.empty() && stale.back().right == x && stale.back().top == y) {
-          stale.back().right = right;
+        std::vector<RenderRect>& rects = stale[color.format == RenderFormat::R8G8B8A8_UNORM ? edram_clears_[tile].value_or(0) : 0];
+        if (!rects.empty() && rects.back().right == x && rects.back().top == y) {
+          rects.back().right = right;
         } else {
-          stale.emplace_back(x, y, right, bottom);
+          rects.emplace_back(x, y, right, bottom);
         }
       });
-      if (!stale.empty()) {
-        commands_->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f), stale.data(), uint32_t(stale.size()));
+      for (const auto& [word, rects] : stale) {
+        commands_->clearColor(0, RenderColor(float((word >> 16) & 0xFF) / 255.0f, float((word >> 8) & 0xFF) / 255.0f,
+                                             float(word & 0xFF) / 255.0f, float(word >> 24) / 255.0f),
+                              rects.data(), uint32_t(rects.size()));
         ++stats_["EDRAM: color target overwritten by another surface"];
       }
     }
     tiles(info & 0xFFF, wide, [&](uint32_t tile, uint32_t, uint32_t, uint32_t, uint32_t) {
       edram_owners_[tile] = &color;
+      edram_clears_[tile] = clear;
     });
   }
   if (depthWritten) {
@@ -1482,7 +1487,8 @@ void Renderer::Clear(const ClearCall& call) {
                       int32_t(call.rect[2] * color.scale_x), int32_t(call.rect[3] * color.scale));
   }
   TrackEdram(call.state, color, depth, call.flags & 0xF, call.flags & 0x30,
-             call.has_rect ? uint32_t(std::max(call.rect[3], 0)) : ViewportBottom(call.state), false);
+             call.has_rect ? uint32_t(std::max(call.rect[3], 0)) : ViewportBottom(call.state), false,
+             call.raw_color ? std::optional<uint32_t>(call.state.Reg(0x231E)) : std::nullopt);
   if (call.flags & 0xF) {
     commands_->clearColor(0, RenderColor(call.color[0], call.color[1], call.color[2], call.color[3]), &rect, 1);
   }
@@ -1609,10 +1615,21 @@ void Renderer::CopyResolveToTable(Texture& source, uint32_t address, uint32_t wi
   Transition(source.texture.get(), RenderTextureLayout::SHADER_READ);
 }
 
+// Bytes per texel of the formats a resolve writes, 0 for the rest.
+static uint32_t ResolveBytes(uint32_t guestFormat) {
+  switch (guestFormat) {
+    case 2: return 1;
+    case 3: case 24: case 30: return 2;
+    case 6: case 7: case 22: case 23: case 25: case 31: case 36: return 4;
+    case 26: case 32: return 8;
+    default: return 0;
+  }
+}
+
 void Renderer::Resolve(const ResolveCall& call) {
   const bool depth = call.flags & 4;
   Texture& source = depth ? GetDepthSurface(call.state) : GetColorSurface(call.state);
-  const uint32_t address = call.state.Reg(0x2319) & 0xFFFFF000;  // RB_COPY_DEST_BASE
+  uint32_t address = call.state.Reg(0x2319) & 0xFFFFF000;  // RB_COPY_DEST_BASE
   const uint32_t destPitch = call.state.Reg(0x231A) & 0x3FFF;      // RB_COPY_DEST_PITCH
   const uint32_t destHeight = (call.state.Reg(0x231A) >> 16) & 0x3FFF;
   int32_t rect[4] = {0, 0, int32_t(destPitch), int32_t(destHeight)};
@@ -1622,18 +1639,33 @@ void Renderer::Resolve(const ResolveCall& call) {
   // from that point (predicated tiling resolves the bands one by one).
   const int32_t x = call.has_dest_point ? call.dest_x : rect[0];
   const int32_t y = call.has_dest_point ? call.dest_y : rect[1];
+  int32_t band = 0;
+  // A band of an earlier resolve's texture (the shadow atlas is resolved in bands, each at a
+  // tile row of the one texture the game fetches at its base): it lands in that texture.
+  if (const uint32_t bytes = ResolveBytes((call.state.Reg(0x231B) >> 7) & 0x3F); bytes && destPitch && !resolved_.count(address)) {
+    const uint32_t rowBytes = destPitch * bytes;
+    for (const auto& [base, parent] : resolved_) {
+      const uint64_t parentBytes = uint64_t(parent.width / parent.scale_x) * uint64_t(parent.height / parent.scale) * bytes;
+      if (!parent.texture || address <= base || address - base >= parentBytes || (address - base) % (32 * rowBytes)) continue;
+      if (uint32_t((parent.width / parent.scale_x) + 0.5f) != destPitch) continue;
+      band = int32_t((address - base) / rowBytes);
+      address = base;
+      break;
+    }
+  }
   // Textures are sampled with normalized coordinates, so the host texture has
   // the size the game fetches it at: the destination pitch, unless that is
   // just the width padded to 32 texels.
   const uint32_t rectWidth = uint32_t(rect[2] - rect[0]);
   const uint32_t width = (rect[0] == 0 && destPitch == ((rectWidth + 31) & ~31u)) ? rectWidth : destPitch;
-  const uint32_t height = uint32_t(y) + destHeight;
+  const int32_t destY = y + band;  // the row the rect lands on in the texture
+  const uint32_t height = uint32_t(destY) + destHeight;
   RenderFormat format = source.format;
   const float scale = source.scale, scaleX = source.scale_x;
   const uint32_t hostWidth = uint32_t(width * scaleX), hostHeight = uint32_t(height * scale);
   const int32_t step = call.source_scale;
   ResolvePushConstants push{source.index, 0, 1.0f, int32_t((rect[0] - x) * step * scaleX),
-                            int32_t((rect[1] - y) * step * scale), source.stencil_index, step};
+                            int32_t((rect[1] - destY) * step * scale), source.stencil_index, step};
   if (depth) {
     // Fetched as 24_8_FLOAT: the depth itself in x, unlike Skate's stencil tags in packed bytes.
     format = RenderFormat::R32_FLOAT;
@@ -1712,10 +1744,10 @@ void Renderer::Resolve(const ResolveCall& call) {
   commands_->setGraphicsPushConstants(0, &push);
   dest.scale = scale;
   dest.scale_x = scaleX;
-  RenderViewport viewport(float(x) * scaleX, float(y) * scale, float(rect[2] - rect[0]) * scaleX,
+  RenderViewport viewport(float(x) * scaleX, float(destY) * scale, float(rect[2] - rect[0]) * scaleX,
                           float(rect[3] - rect[1]) * scale);
-  RenderRect scissor(int32_t(x * scaleX), int32_t(y * scale), int32_t((x + rect[2] - rect[0]) * scaleX),
-                     int32_t((y + rect[3] - rect[1]) * scale));
+  RenderRect scissor(int32_t(x * scaleX), int32_t(destY * scale), int32_t((x + rect[2] - rect[0]) * scaleX),
+                     int32_t((destY + rect[3] - rect[1]) * scale));
   // The full-screen triangle covers the viewport; the shader reads by pixel.
   viewport = RenderViewport(0.0f, 0.0f, float(dest.width), float(dest.height));
   commands_->setViewports(&viewport, 1);
@@ -1760,14 +1792,7 @@ void Renderer::Resolve(const ResolveCall& call) {
         ++stats_["table: resolve before the table exists"];
       }
     }
-    uint32_t guestBytes = 0;
-    switch (guestFormat) {
-      case 2: guestBytes = 1; break;
-      case 3: case 24: case 30: guestBytes = 2; break;
-      case 6: case 7: case 22: case 23: case 25: case 31: case 36: guestBytes = 4; break;
-      case 26: case 32: guestBytes = 8; break;
-      default: break;
-    }
+    const uint32_t guestBytes = ResolveBytes(guestFormat);
     // Only what this resolve wrote: tables are updated a few pages at a time.
     const uint32_t rectWidth2 = uint32_t(std::max(rect[2] - rect[0], 0));
     const uint32_t rectHeight2 = uint32_t(std::max(rect[3] - rect[1], 0));
@@ -1775,9 +1800,9 @@ void Renderer::Resolve(const ResolveCall& call) {
         uint64_t(rectWidth2) * rectHeight2 * guestBytes <= 256 * 1024) {
       ReadBackTarget target{guestBytes, destPitch, info & 7};
       target.x = uint32_t(x);
-      target.y = uint32_t(y);
+      target.y = uint32_t(destY);
       target.width = std::min(rectWidth2, dest.width - std::min(uint32_t(x), dest.width));
-      target.height = std::min(rectHeight2, dest.height - std::min(uint32_t(y), dest.height));
+      target.height = std::min(rectHeight2, dest.height - std::min(uint32_t(destY), dest.height));
       target.address = address;
       target.format = guestFormat;
       target.swap_red_blue = (info >> 24) & 1;
@@ -2396,10 +2421,19 @@ void Renderer::Draw(const DrawCall& call) {
   const float sz = state.RegF(xenos::reg::PA_CL_VPORT_ZSCALE);
   const float oz = state.RegF(xenos::reg::PA_CL_VPORT_ZOFFSET);
   RenderViewport viewport(ox - sx, oy + sy, 2.0f * sx, -2.0f * sy, oz, oz + sz);
-  const float boundViewport[] = {ox, oy, sx, sy, oz, sz, float(color.width), float(color.height)};
+  // The window scissor: the lighting pass draws its full-screen quad in strips, each with its own lights.
+  RenderRect scissor(0, 0, int32_t(color.width), int32_t(color.height));
+  const uint32_t scissorTL = call.scissor_tl, scissorBR = call.scissor_br;
+  if (!interfaceDraw && (scissorBR & 0x7FFF) && ((scissorBR >> 16) & 0x7FFF)) {
+    scissor.left = std::min(int32_t((scissorTL & 0x7FFF) * xScale), scissor.right);
+    scissor.top = std::min(int32_t(((scissorTL >> 16) & 0x7FFF) * scaleXy), scissor.bottom);
+    scissor.right = std::min(int32_t((scissorBR & 0x7FFF) * xScale), scissor.right);
+    scissor.bottom = std::min(int32_t(((scissorBR >> 16) & 0x7FFF) * scaleXy), scissor.bottom);
+  }
+  const float boundViewport[] = {ox, oy, sx, sy, oz, sz, float(color.width), float(color.height),
+                                 float(scissor.left), float(scissor.top), float(scissor.right), float(scissor.bottom)};
   if (!has_bound_viewport_ || std::memcmp(bound_viewport_, boundViewport, sizeof(boundViewport))) {
     commands_->setViewports(&viewport, 1);
-    RenderRect scissor(0, 0, int32_t(color.width), int32_t(color.height));
     commands_->setScissors(&scissor, 1);
     std::memcpy(bound_viewport_, boundViewport, sizeof(boundViewport));
     has_bound_viewport_ = true;

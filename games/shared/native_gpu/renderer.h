@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -36,6 +37,8 @@ struct DrawCall {
   uint64_t vs_key = 0;
   uint64_t ps_key = 0;
   uint32_t primitive = 0;  // Xenos primitive type
+  // PA_SC_WINDOW_SCISSOR_TL / BR (the surface's size when never set), in the draw's own samples.
+  uint32_t scissor_tl = 0, scissor_br = 0;
   uint32_t base_vertex = 0;
   uint32_t start = 0;      // first index or vertex
   uint32_t count = 0;
@@ -66,6 +69,7 @@ struct ClearCall {
   bool has_rect = false;
   int32_t rect[4] = {};  // x1, y1, x2, y2
   float color[4] = {};
+  bool raw_color = false;  // RB_COLOR_CLEAR in the state: the word the tiles hold, whatever format they are read as
   float depth = 1.0f;    // the Z argument (f1)
   uint32_t stencil = 0;  // the stencil argument
 };
@@ -247,9 +251,9 @@ class Renderer {
   void SetMainLayout();
   // Records which EDRAM tiles the pass's targets write (`height` rows from the
   // top). With `check`, first clears the color target's tiles that another
-  // surface wrote since it did.
+  // surface wrote since it did, to the raw word a clear left there (`clear`).
   void TrackEdram(const xenos::DeviceState& state, Texture& color, Texture& depth, bool color_written,
-                  bool depth_written, uint32_t height, bool check);
+                  bool depth_written, uint32_t height, bool check, std::optional<uint32_t> clear = std::nullopt);
   uint64_t Allocate(const void* data, uint64_t size, uint64_t alignment = 256);
 
   struct GuestBuffer {
@@ -366,6 +370,8 @@ class Renderer {
   // The surface that last wrote each EDRAM tile (5120 bytes). Surfaces at
   // overlapping EDRAM ranges share memory on the GPU but not here.
   std::vector<const Texture*> edram_owners_ = std::vector<const Texture*>(2048);
+  // The raw word the last clear left in each tile, until a draw writes it.
+  std::vector<std::optional<uint32_t>> edram_clears_ = std::vector<std::optional<uint32_t>>(2048);
   bool main_layout_bound_ = false;
   std::map<std::string, uint32_t> stats_;
   uint64_t TextureContentHash(const xenos::TextureFetch& t, uint32_t byte_size) const;
@@ -417,7 +423,7 @@ class Renderer {
   std::array<SlotBinding, 1024> bindings_;
   uint32_t texture_generation_ = 1;
   const void* bound_pipeline_ = nullptr;
-  float bound_viewport_[8] = {}, bound_bias_[2] = {};
+  float bound_viewport_[12] = {}, bound_bias_[2] = {};
   bool has_bound_viewport_ = false, has_bound_bias_ = false;
   Timings timings_;
   double texture_frame_ms_ = 0.0, buffer_frame_ms_ = 0.0;

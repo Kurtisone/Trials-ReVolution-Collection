@@ -711,7 +711,8 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   call.primitive = event.primitive;
   call.scissor_tl = event.registers[0x2081];  // PA_SC_WINDOW_SCISSOR_TL
   call.scissor_br = event.registers[0x2082];
-  if (Surface4x(event.registers)) {
+  call.surface_4x = Surface4x(event.registers);
+  if (call.surface_4x) {
     call.scissor_tl = DoublePair(call.scissor_tl, 0x80000000u);
     call.scissor_br = DoublePair(call.scissor_br, 0x80000000u);
   }

@@ -9,8 +9,8 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, 50 FPS and 19.5 ms a frame on the renderer thread on RADV (Renoir). Base colours, normals, ambient and
-  point lights work; the sun has no light on most surfaces (shadow mask, below), so the picture is dark and flat.
+* First track: reached, 51 FPS and 19.2 ms a frame on the renderer thread on RADV (Renoir). Base colours, normals, ambient and
+  point lights work; the sun still adds little (shadow mask, below), so the picture is dark next to the emulated one.
 * Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
   95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
@@ -42,23 +42,39 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
 * The table readback to guest memory (what the CPU reads to know which pages sit where) had red and blue swapped in its
   1_5_5_5 words, and truncated 11 to 10; now the same words as the emulated run's for the common entries (42,000 of 1,048,576 differ, as pages move).
 * `getCompTexLOD` wrote its result to x whatever the destination swizzle; the feedback shaders read it in y.
-* Page draws (BCFF66D9 / 758C4BE0), counted over a whole run on Greenhorn's Grove: emulated 52 at the start, then about 2,500
-  in the 2,000 frames after the track begins, and none after; native 64 in all, never more after the first seconds. The
-  feedback decides: at a trace on the track the emulated 256x128 feedback has a request in 99 % of its pixels (alpha 8 to
-  10 mostly), the native one in 30 %, all in a rectangle of the top left 120x64 texels, whatever the viewport (doubling it
-  zooms what is in it, the rectangle stays). Replacing the terrain pixel shader's (C73B91C3) output by a constant fills exactly
-  that rectangle, so it is the terrain draws (VS 23F30886) that cover only that corner; the depth outside it is a smooth ramp
-  from other draws, with zero colour. Not found why (VS constants, the terrain height fetch, or the position of its vertices);
-  the camera of the two traces is not the same frame, but the coverage is far apart anyway.
+* Page draws (BCFF66D9 / 758C4BE0; the renderer counts "memory export draws"), over a whole run on Greenhorn's Grove: emulated 52 at
+  the start, then about 2,500 in the 2,000 frames after the track begins, and none after; native now 3,800 after 80 s on the
+  track, about one a frame throughout (it was 64 in all before). The feedback decides, and its coverage was the rectangle of
+  the top left 120x64 texels (30 %) where the emulated one has requests in 99 %; native is now 100 % (`fb.py`). Cause: the
+  clears of the pass are rect lists in window coordinates (PA_CL_VTE_CNTL 0x300), two to a pass, the second on the 4x
+  surface (RB_SURFACE_INFO msaa 2) that covers what the first leaves: (240..256, all rows) and (0..120, 0..64) in 4x samples,
+  that is (0..240, 0..128) in the 1x samples the renderer draws at. The renderer doubled that draw's viewport and pitch but
+  not the vertices, so only a quarter was cleared, the depth (GEQUAL) held what other passes left and the terrain (VS
+  23F30886: positions are 16_16_16_16 integers times c20..c23, nothing wrong there) lost the depth test outside the corner.
+  Disabling the terrain's depth test gave 100 % too. `DrawCall::surface_4x` doubles `g_ScreenMul` for window coordinates.
+  The same bug cleared a quarter of the shadow caster pass's (4x, 16_16) tiles: the atlas bands now hold casters (about half
+  of band 0 differs from the clear word, as in the emulated dump).
 * Both modes reach Greenhorn's Grove from a script that waits for screens (scratchpad nav.py: coarse normalised
   front-buffer signatures, Space only on a known menu screen). `native_gpu_observe` now takes the same trace frame as
   the native run (`native_gpu_trace_frame = -1`: the 240th frame of 800+ draws) and writes the front buffer from guest
   memory on `<dump>.trigger`. Guest allocations (so addresses) differ between runs and modes, compare by role.
-* Fixed, shadow side: the shadow mask atlas pass draws 8_8_8_8 stamps into EDRAM tiles that a 16_16 pass cleared;
-  those tiles hold the clear word (white), the native 8888 surface started at zero. Clears now leave their raw word per
-  tile and a surface taking over the tiles reads it. Band 0 of the 1_5_5_5 atlas is white like the emulated one; the others are not (below). Resolves
-  landing in the middle of an earlier resolved texture (the atlas is resolved in 512-row bands at tile row offsets)
-  now go into that texture instead of a new one at their own address.
+* The shadow atlas, as the game builds it (512 wide, 4 bands of 512 rows; band 0 every frame, 1 every second, 2 and 3 every
+  fourth). For each band: a 16_16 pass (the casters, tiles at 0x340, pitch 1040), its resolve to the k_16_16 atlas (4 bytes a
+  texel, 512x2048, `15C5F000` here) with a colour clear riding on it (RB_COLOR_CLEAR = FFFFFFFF), then a resolve of the same
+  tiles read as 8_8_8_8 to the 1_5_5_5 atlas (2 bytes, `15A5F000`, swap red and blue) with its own clear (7FFF7FFF or 0),
+  and for bands 2 and 3 first 8_8_8_8 stamps (B8CF2FCB) drawn over the tiles. So the 1_5_5_5 atlas holds the clear word
+  (white) wherever nothing was stamped, which is the emulated dump (white throughout, data in rows 1024 and up). What the renderer
+  got wrong: (1) a resolve in another format than the one that wrote the tiles read a surface nothing had written (zero);
+  a colour resolve now first clears the tiles owned by another surface to the word the last clear left (`TrackEdram`
+  with `read_only`); (2) the clear word was decoded as ARGB bytes for any format, it is the raw sample (red in the low
+  byte, the 16_16 formats 1/1024 steps of an int16): `ClearWordColor`; (3) a band resolved at the right offset of another
+  resolve's texture was merged into it whatever the texel size, so the k_16_16 atlas's band 1 (+1 MB) fell into the
+  1_5_5_5 atlas 2 MB before it: `Texture::texel_bytes` must match; (4) a rectangle clear in the resolve's own pass left
+  the rows below the first 256 black on RADV (as read by the resolve shader; a copy of the surface showed them cleared,
+  a clear without rectangles works), so one word covering everything clears the whole surface. Not understood.
+* Depth is shared in EDRAM too: a depth clear riding on a resolve clears the tiles of every pass that follows, whatever its
+  host depth surface. The renderer keeps the raw depth word per tile (`edram_depth_clears_`) and a draw that takes the
+  tiles over clears its depth surface to it (the feedback pass needs that besides the 4x fix above).
 * Fixed: the window scissor (PA_SC_WINDOW_SCISSOR) was ignored; the lighting pass (3743B184) draws a full-screen quad in 16
   strips of 38 rows, each with its own lights and no blending, so each draw overwrote the screen.
 * The lighting pass (3743B184) was dark for four reasons, all found by sending intermediate registers to its output
@@ -76,12 +92,13 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   4. The `cube` instruction was translated as `cube(r)` of its first register, unswizzled. The hardware takes the direction
      v as v.zzxy and v.yxzz in its two operands; the translation now takes the second operand's `.yxz`.
   The picture is now lit (albedo, normals, ambient, lights), HDR mean 0.08 to 0.11 with max 2.5 where emulated is 0.13.
-* Still wrong, the sun: its shadow term is 0 on most of the floor and walls. The shadow mask (40768DE1, volume boxes drawn at
-  4x and 1x with stencil ops, resolved as k_8_8) is black on all geometry where the emulated one is white with dark edges, and
-  its input, the 512x2048 1_5_5_5 atlas, has band 0 white, band 1 the clear word (255, 127, 255, 127) and bands 2 and 3 zero
-  where the emulated one is white throughout. Each band is resolved at the right rate (band 0 every frame, 1 every second, 2 and
-  3 every fourth), so what is wrong is what the EDRAM tiles hold when the 8888 stamps draw over them (clears riding on the
-  resolves, the 16_16 pass that clears to white before them) or the stamps themselves. Not found.
+* Still wrong, the sun: the mask (40768DE1) now has no black, but its red channel, the shadow term, is 1 everywhere where the
+  emulated one is 0 in shadow (same moment: `scratchpad/z34`, the bike, the railings, the wall). The PS writes
+  r = fade + the variance shadow term from slot 2 (the k_16_16 atlas, signed, so SNORM here), g, b, a = fade + slot 3 (the
+  1_5_5_5 atlas) .xyz; the lighting pass reads the mask's x and y. The native blue channel has exactly the shapes the
+  emulated red has, so the geometry (volumes, stencil, 4x/1x) is right and it is the term from the 16_16 atlas that says lit:
+  its fetch (sign 1, exp 0.999969, 512x2048) and coordinates are the next thing to check, or the atlas bands the caster
+  pass fills (band 0 holds casters, bands 1 to 3 hold the clear word and zero).
 * Tools: the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
   resolve swaps red and blue. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
   its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
@@ -89,9 +106,10 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
 
 Next, in order:
 
-1. The sun: the shadow atlas bands and the volume stencil passes (above).
-2. Page loading: why the terrain draws of the feedback pass cover the top left corner only (above).
-3. Frame rate: 50 FPS on the track, 19.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
+1. The sun: the shadow term from the 16_16 atlas (above).
+2. Page loading: native keeps requesting one page a frame where the emulated run stops after about 2,500; the atlases hold
+   3 % of their blocks 70 s into the track (emulated not measured).
+3. Frame rate: 51 FPS on the track, 19.2 ms a frame on the renderer thread (RADV, Renoir), aim 60.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

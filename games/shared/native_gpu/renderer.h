@@ -39,6 +39,7 @@ struct DrawCall {
   uint32_t primitive = 0;  // Xenos primitive type
   // PA_SC_WINDOW_SCISSOR_TL / BR (the surface's size when never set), in the draw's own samples.
   uint32_t scissor_tl = 0, scissor_br = 0;
+  bool surface_4x = false;  // the surface is 4x: the registers are doubled, vertices in window coordinates are not
   uint32_t base_vertex = 0;
   uint32_t start = 0;      // first index or vertex
   uint32_t count = 0;
@@ -207,6 +208,7 @@ class Renderer {
     std::unique_ptr<plume::RenderTextureView> volume_view;
     uint32_t volume_index = 0, layers = 0;
     uint32_t resolved_size = 0;  // the guest memory a resolve writes
+    uint32_t texel_bytes = 0;    // resolved textures: bytes a texel takes in guest memory
     uint64_t content_hash = 0;   // guest textures, NATIVE_GPU_VERIFY_TEXTURES
     uint32_t watch_stamp = 0;    // guest and resolved textures: WriteWatcher::Watch's
     uint32_t export_generation = 0;  // textures laid out from memory export: the region's, when they were
@@ -254,7 +256,8 @@ class Renderer {
   // top). With `check`, first clears the color target's tiles that another
   // surface wrote since it did, to the raw word a clear left there (`clear`).
   void TrackEdram(const xenos::DeviceState& state, Texture& color, Texture& depth, bool color_written,
-                  bool depth_written, uint32_t height, bool check, std::optional<uint32_t> clear = std::nullopt);
+                  bool depth_written, uint32_t height, bool check, std::optional<uint32_t> clear = std::nullopt,
+                  std::optional<uint32_t> depth_clear = std::nullopt, bool read_only = false);
   uint64_t Allocate(const void* data, uint64_t size, uint64_t alignment = 256);
 
   struct GuestBuffer {
@@ -373,6 +376,8 @@ class Renderer {
   std::vector<const Texture*> edram_owners_ = std::vector<const Texture*>(2048);
   // The raw word the last clear left in each tile, until a draw writes it.
   std::vector<std::optional<uint32_t>> edram_clears_ = std::vector<std::optional<uint32_t>>(2048);
+  // And the raw depth word (RB_DEPTH_CLEAR) a depth clear left.
+  std::vector<std::optional<uint32_t>> edram_depth_clears_ = std::vector<std::optional<uint32_t>>(2048);
   bool main_layout_bound_ = false;
   std::map<std::string, uint32_t> stats_;
   uint64_t TextureContentHash(const xenos::TextureFetch& t, uint32_t byte_size) const;

@@ -248,6 +248,41 @@ uint32_t EdramFormat(uint32_t color_format) {
   return color_format == 10 ? 2 : color_format == 12 ? 3 : color_format;
 }
 
+// What EDRAM holds after a clear (RB_COLOR_CLEAR, the raw 32-bit sample: red in the low byte or 16 bits), read
+// in an EDRAM color format. The 16_16 formats keep -32..32 as 1/1024 steps of the 16-bit integer.
+RenderColor ClearWordColor(uint32_t colorFormat, uint32_t word) {
+  const auto fixed = [](uint32_t bits) { return float(int16_t(bits & 0xFFFF)) / 1024.0f; };
+  switch (EdramFormat(colorFormat)) {
+    case 4: return RenderColor(fixed(word), fixed(word >> 16), 0.0f, 0.0f);
+    case 5: return RenderColor(fixed(word), fixed(word >> 16), fixed(word), fixed(word >> 16));
+    default:
+      return RenderColor(float(word & 0xFF) / 255.0f, float((word >> 8) & 0xFF) / 255.0f,
+                         float((word >> 16) & 0xFF) / 255.0f, float(word >> 24) / 255.0f);
+  }
+}
+
+// Tile rectangles in row order: the strips of each row joined, then the rows of equal strips.
+void AddTileRect(std::vector<RenderRect>& rects, int32_t x, int32_t y, int32_t right, int32_t bottom) {
+  if (!rects.empty() && rects.back().right == x && rects.back().top == y) {
+    rects.back().right = right;
+  } else {
+    rects.emplace_back(x, y, right, bottom);
+  }
+}
+
+void JoinTileRows(std::vector<RenderRect>& rects) {
+  size_t out = 0;
+  for (size_t i = 0; i < rects.size(); ++i) {
+    if (out && rects[out - 1].left == rects[i].left && rects[out - 1].right == rects[i].right &&
+        rects[out - 1].bottom == rects[i].top) {
+      rects[out - 1].bottom = rects[i].bottom;
+    } else {
+      rects[out++] = rects[i];
+    }
+  }
+  rects.resize(out);
+}
+
 RenderFormat SurfaceFormat(uint32_t color_format) {
   switch (color_format) {
     case 0: case 1: return RenderFormat::R8G8B8A8_UNORM;  // 8_8_8_8 (_GAMMA)
@@ -1423,13 +1458,14 @@ Renderer::Texture& Renderer::GetDepthSurface(const xenos::DeviceState& state) {
 }
 
 void Renderer::TrackEdram(const xenos::DeviceState& state, Texture& color, Texture& depth, bool colorWritten,
-                          bool depthWritten, uint32_t height, bool check, std::optional<uint32_t> clear) {
+                          bool depthWritten, uint32_t height, bool check, std::optional<uint32_t> clear,
+                          std::optional<uint32_t> depthClear, bool readOnly) {
   const uint32_t surfaceInfo = state.Reg(xenos::reg::RB_SURFACE_INFO);
   // Draws in a row on the same targets: every tile is already theirs.
   const EdramUse use{&color, &depth, surfaceInfo, state.Reg(xenos::reg::RB_COLOR_INFO),
                      state.Reg(xenos::reg::RB_DEPTH_INFO), height, colorWritten, depthWritten};
-  if (check && !std::memcmp(&use, &last_edram_use_, sizeof(use))) return;
-  last_edram_use_ = use;
+  if (!readOnly && check && !std::memcmp(&use, &last_edram_use_, sizeof(use))) return;
+  if (!readOnly) last_edram_use_ = use;
   const uint32_t pitch = std::max(surfaceInfo & 0x3FFF, 1u);
   const uint32_t msaa = (surfaceInfo >> 16) & 3;
   height = std::min(height, kMaxSurfaceHeight);
@@ -1455,35 +1491,54 @@ void Renderer::TrackEdram(const xenos::DeviceState& state, Texture& color, Textu
       // surface's last contents; passes that keep what is in EDRAM (Skate's
       // untiled scene path clears depth only, and foliage writes no alpha)
       // must not get an old frame. Clear them, as the tiled path does.
-      // A clear's word read in this surface's format; anything else reads as zero.
+      // The word a clear left in the tile, read in this surface's format; tiles no clear reached read as zero.
       std::map<uint32_t, std::vector<RenderRect>> stale;
       tiles(info & 0xFFF, wide, [&](uint32_t tile, uint32_t column, uint32_t row, uint32_t w, uint32_t h) {
         const Texture* owner = edram_owners_[tile];
         if (!owner || owner == &color || owner == &depth) return;
         const int32_t x = int32_t(column * w * color.scale_x), y = int32_t(row * h * color.scale);
         const int32_t right = int32_t((column + 1) * w * color.scale_x), bottom = int32_t((row + 1) * h * color.scale);
-        std::vector<RenderRect>& rects = stale[color.format == RenderFormat::R8G8B8A8_UNORM ? edram_clears_[tile].value_or(0) : 0];
-        if (!rects.empty() && rects.back().right == x && rects.back().top == y) {
-          rects.back().right = right;
-        } else {
-          rects.emplace_back(x, y, right, bottom);
-        }
+        AddTileRect(stale[edram_clears_[tile].value_or(0)], x, y, right, bottom);
       });
-      for (const auto& [word, rects] : stale) {
-        commands_->clearColor(0, RenderColor(float((word >> 16) & 0xFF) / 255.0f, float((word >> 8) & 0xFF) / 255.0f,
-                                             float(word & 0xFF) / 255.0f, float(word >> 24) / 255.0f),
-                              rects.data(), uint32_t(rects.size()));
+      for (auto& [word, rects] : stale) {
+        JoinTileRows(rects);
+        // A resolve clears the whole surface when one word covers it: on RADV the rows below the first 256 of
+        // a rectangle clear in the resolve's own pass read back as zero.
+        const bool whole = readOnly && stale.size() == 1;
+        commands_->clearColor(0, ClearWordColor(format, word), whole ? nullptr : rects.data(), whole ? 0 : uint32_t(rects.size()));
         ++stats_["EDRAM: color target overwritten by another surface"];
       }
     }
-    tiles(info & 0xFFF, wide, [&](uint32_t tile, uint32_t, uint32_t, uint32_t, uint32_t) {
-      edram_owners_[tile] = &color;
-      edram_clears_[tile] = clear;
-    });
+    if (!readOnly) {
+      tiles(info & 0xFFF, wide, [&](uint32_t tile, uint32_t, uint32_t, uint32_t, uint32_t) {
+        edram_owners_[tile] = &color;
+        edram_clears_[tile] = clear;
+        edram_depth_clears_[tile].reset();
+      });
+    }
   }
   if (depthWritten) {
-    tiles(state.Reg(xenos::reg::RB_DEPTH_INFO) & 0xFFF, false,
-          [&](uint32_t tile, uint32_t, uint32_t, uint32_t, uint32_t) { edram_owners_[tile] = &depth; });
+    // Tiles another depth surface's clear last reached hold that clear's value: the pass keeps no clear of its
+    // own (the feedback pass's rectangles cover a corner, the resolve of the pass before cleared every tile).
+    std::map<uint32_t, std::vector<RenderRect>> stale;
+    if (check) {
+      tiles(state.Reg(xenos::reg::RB_DEPTH_INFO) & 0xFFF, false,
+            [&](uint32_t tile, uint32_t column, uint32_t row, uint32_t w, uint32_t h) {
+              if (!edram_depth_clears_[tile] || edram_owners_[tile] == &depth) return;
+              const int32_t x = int32_t(column * w * depth.scale_x), y = int32_t(row * h * depth.scale);
+              const int32_t right = int32_t((column + 1) * w * depth.scale_x), bottom = int32_t((row + 1) * h * depth.scale);
+              AddTileRect(stale[*edram_depth_clears_[tile]], x, y, right, bottom);
+            });
+    }
+    for (auto& [word, rects] : stale) {
+      JoinTileRows(rects);
+      commands_->clearDepthStencil(true, true, float(word >> 8) / 16777215.0f, word & 0xFF, rects.data(), uint32_t(rects.size()));
+      ++stats_["EDRAM: depth target overwritten by another surface"];
+    }
+    tiles(state.Reg(xenos::reg::RB_DEPTH_INFO) & 0xFFF, false, [&](uint32_t tile, uint32_t, uint32_t, uint32_t, uint32_t) {
+      edram_owners_[tile] = &depth;
+      edram_depth_clears_[tile] = depthClear;
+    });
   }
 }
 
@@ -1498,9 +1553,12 @@ void Renderer::Clear(const ClearCall& call) {
   }
   TrackEdram(call.state, color, depth, call.flags & 0xF, call.flags & 0x30,
              call.has_rect ? uint32_t(std::max(call.rect[3], 0)) : ViewportBottom(call.state), false,
-             call.raw_color ? std::optional<uint32_t>(call.state.Reg(0x231E)) : std::nullopt);
+             call.raw_color ? std::optional<uint32_t>(call.state.Reg(0x231E)) : std::nullopt,
+             call.raw_color ? std::optional<uint32_t>(call.state.Reg(0x231D)) : std::nullopt);
   if (call.flags & 0xF) {
-    commands_->clearColor(0, RenderColor(call.color[0], call.color[1], call.color[2], call.color[3]), &rect, 1);
+    commands_->clearColor(0, call.raw_color ? ClearWordColor((call.state.Reg(xenos::reg::RB_COLOR_INFO) >> 16) & 0xF, call.state.Reg(0x231E))
+                                            : RenderColor(call.color[0], call.color[1], call.color[2], call.color[3]),
+                          &rect, 1);
   }
   if (call.flags & 0x30) {
     // The Z and stencil arguments: RB_DEPTH_CLEAR in the shadow only follows
@@ -1651,6 +1709,14 @@ static uint32_t ResolveBytes(uint32_t guestFormat) {
 void Renderer::Resolve(const ResolveCall& call) {
   const bool depth = call.flags & 4;
   Texture& source = depth ? GetDepthSurface(call.state) : GetColorSurface(call.state);
+  // A colour resolve in another format than the one that wrote the tiles (the 16_16 shadow pass read as
+  // 8_8_8_8 right after its clearing resolve) reads what the tiles hold: the clear word.
+  if (!depth) {
+    Texture& depthSurface = GetDepthSurface(call.state);
+    SetTargets(source.texture.get(), nullptr);
+    TrackEdram(call.state, source, depthSurface, true, false,
+               call.has_rect ? uint32_t(std::max(call.rect[3], 0)) : ViewportBottom(call.state), true, std::nullopt, std::nullopt, true);
+  }
   uint32_t address = call.state.Reg(0x2319) & 0xFFFFF000;  // RB_COPY_DEST_BASE
   const uint32_t destPitch = call.state.Reg(0x231A) & 0x3FFF;      // RB_COPY_DEST_PITCH
   const uint32_t destHeight = (call.state.Reg(0x231A) >> 16) & 0x3FFF;
@@ -1668,7 +1734,7 @@ void Renderer::Resolve(const ResolveCall& call) {
     const uint32_t rowBytes = destPitch * bytes;
     for (const auto& [base, parent] : resolved_) {
       const uint64_t parentBytes = uint64_t(parent.width / parent.scale_x) * uint64_t(parent.height / parent.scale) * bytes;
-      if (!parent.texture || address <= base || address - base >= parentBytes || (address - base) % (32 * rowBytes)) continue;
+      if (!parent.texture || parent.texel_bytes != bytes || address <= base || address - base >= parentBytes || (address - base) % (32 * rowBytes)) continue;
       if (uint32_t((parent.width / parent.scale_x) + 0.5f) != destPitch) continue;
       band = int32_t((address - base) / rowBytes);
       address = base;
@@ -1727,6 +1793,7 @@ void Renderer::Resolve(const ResolveCall& call) {
   }
 
   Texture& dest = resolved_[address];
+  dest.texel_bytes = ResolveBytes((call.state.Reg(0x231B) >> 7) & 0x3F);
   if (!dest.texture || dest.format != format || dest.width != hostWidth || dest.height < hostHeight) {
     ++texture_generation_;
     if (dest.texture) {
@@ -1882,6 +1949,7 @@ void Renderer::Draw(const DrawCall& call) {
   }
 
   for (uint32_t i = 0; i < call.export_count; ++i) AddExportRange(call.exports[i].address, call.exports[i].size);
+  if (call.export_count) ++stats_["memory export draws"];
   // Memory export draws write the buffer the draws before them wrote and read.
   if (call.export_count) ExportBarrier();
 
@@ -2393,7 +2461,7 @@ void Renderer::Draw(const DrawCall& call) {
     const float hostScale[2] = {xScale, scaleXy};
     for (int axis = 0; axis < 2; ++axis) {
       if (scales[axis] == 0.0f) continue;
-      shared.screenMul[axis] = 1.0f / scales[axis];
+      shared.screenMul[axis] = (call.surface_4x ? 2.0f : 1.0f) / scales[axis];
       shared.screenAdd[axis] = -(offsets[axis] + pixelCenter / hostScale[axis]) / scales[axis];
     }
   }

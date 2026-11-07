@@ -66,7 +66,7 @@ REXCVAR_DEFINE_BOOL(native_gpu_memexport_plugin, false, "GPU",
                     "Leave memory export draws to the emulated GPU, after rendering the frame so far for it");
 REXCVAR_DEFINE_INT32(native_gpu_trace_frame, 0, "GPU", "Log the commands of this frame");
 REXCVAR_DEFINE_STRING(native_gpu_dump_path, "native_frame.ppm", "GPU",
-                      "Creating <path>.trigger writes the next front buffer here");
+                      "Creating <path>.trigger writes the next front buffer here, <path>.trace traces and dumps the next frame");
 
 namespace {
 
@@ -908,9 +908,9 @@ void DumpGuestFrontBuffer(uint32_t address) {
     for (uint32_t x = 0; x < kWidth; ++x) {
       const uint8_t* pixel = source + xenos::TiledOffset2D(int32_t(x), int32_t(y), kWidth, 2);
       uint8_t* out = &rgba[(y * kWidth + x) * 4];
-      out[0] = pixel[3];  // the dwords hold A, R, G, B in memory order
-      out[1] = pixel[2];
-      out[2] = pixel[1];
+      out[0] = pixel[0];  // the front buffer's resolve swaps red and blue: R, G, B, A in memory order
+      out[1] = pixel[1];
+      out[2] = pixel[2];
       out[3] = 0xFF;
     }
   }
@@ -949,17 +949,43 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
       }
     }
     static bool tracing = false;
+    struct Resolve {
+      uint32_t address, pitch, rows, format;
+    };
+    static std::vector<Resolve> resolves;
     if (event.kind == Kind::kSwap) {
-      // The same frame as the native trace's (native_gpu_trace_frame = -1); the front buffer on request.
-      tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws > 800 && heavy++ == 240;
-      draws = 0;
+      // The same frame as the native trace's (native_gpu_trace_frame = -1, or <dump>.trace), with its front
+      // buffer, like the native dump's, and what each resolve left in guest memory; the front buffer on request.
       std::error_code error;
-      if (std::filesystem::remove(REXCVAR_GET(native_gpu_dump_path) + ".trigger", error)) {
+      const std::string path = REXCVAR_GET(native_gpu_dump_path);
+      if (std::filesystem::remove(path + ".trigger", error) || tracing) {
         DumpGuestFrontBuffer(event.front_buffer & 0x1FFFFFFF);
       }
+      for (size_t i = 0; i < resolves.size(); ++i) {
+        const Resolve& resolve = resolves[i];
+        const xenos::TextureBlock block = xenos::GetTextureBlock(resolve.format);
+        const size_t bytes = size_t(resolve.pitch) * resolve.rows * block.bytes;
+        if (!bytes || bytes > (64u << 20)) continue;
+        const std::string file = fmt::format("{}.{:03}.{:08X}_{}x{}_guest{}.bin", path, i + 1, resolve.address, resolve.pitch,
+                                             resolve.rows, resolve.format);
+        if (FILE* f = std::fopen(file.c_str(), "wb")) {
+          std::fwrite(g_memory->TranslatePhysical(resolve.address), 1, bytes, f);
+          std::fclose(f);
+        }
+      }
+      resolves.clear();
+      tracing = (REXCVAR_GET(native_gpu_trace_frame) == -1 && draws > 800 && heavy++ == 240) ||
+                std::filesystem::remove(path + ".trace", error);
+      draws = 0;
     } else {
       draws += event.kind == Kind::kDraw;
-      if (tracing) TraceCommand(event, false);
+      if (tracing) {
+        TraceCommand(event, false);
+        const uint32_t* r = event.registers;
+        if (event.kind == Kind::kCopy) {
+          resolves.push_back({r[0x2319] & 0xFFFFF000, r[0x231A] & 0x3FFF, (r[0x231A] >> 16) & 0x3FFF, (r[0x231B] >> 7) & 0x3F});
+        }
+      }
     }
     return false;
   }
@@ -967,7 +993,9 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   static bool tracing = false;
   if (event.kind == Kind::kDraw) ++draws_this_frame;
   if (event.kind == Kind::kSwap) {
-    tracing = REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 800 && traced++ == 240;
+    std::error_code error;
+    tracing = (REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 800 && traced++ == 240) ||
+              std::filesystem::remove(REXCVAR_GET(native_gpu_dump_path) + ".trace", error);
     draws_this_frame = 0;
     g_trace_index = tracing ? 1 : 0;
   }

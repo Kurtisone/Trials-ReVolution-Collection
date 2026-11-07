@@ -87,12 +87,22 @@ struct SharedConstants {
   float screenAdd[3] = {};
   // Memory export: the buffer's address, and the guest ranges it holds (start, end, offset in it).
   uint64_t exportMemory{};
-  uint32_t padding2[2]{};
+  // For each slot, four bits: the components a fetch constant marks as unsigned biased (twice the value less one).
+  uint32_t texBias[2]{};
   uint32_t exportRegions[kMaxExportRegions][4]{};
 };
 static_assert(offsetof(SharedConstants, posScaleX) == 288 && offsetof(SharedConstants, texExpScale) == 296 &&
               offsetof(SharedConstants, screenMul) == 360 && offsetof(SharedConstants, screenAdd) == 372 &&
               offsetof(SharedConstants, exportMemory) == 384 && offsetof(SharedConstants, exportRegions) == 400);
+
+// The components (x in bit 0) the fetch constant's sign fields make unsigned biased.
+uint32_t TextureBiasBits(const xenos::DeviceState& state, uint32_t slot) {
+  const uint32_t word0 = state.U32(xenos::device::kFetchConstants + 24 * slot);
+  if ((word0 & 3) != 2) return 0;
+  uint32_t bits = 0;
+  for (uint32_t c = 0; c < 4; ++c) bits |= uint32_t(((word0 >> (2 + 2 * c)) & 3) == 2) << c;
+  return bits;
+}
 
 // The factor a fetch multiplies its result by: 2^exponent from fetch constant word 3, and for integer
 // formats (num_format 1) the full range, because the host texture is normalized.
@@ -1520,6 +1530,18 @@ void Renderer::RetireResolved(Texture& dest) {
   RetireVolume(dest);
 }
 
+// The texture heap slots of a retired resolve texture, free once the frame that may sample it is done.
+void Renderer::RetireResolvedSlots(Texture& dest) {
+  if (dest.index) retired_slots_.emplace_back(1, dest.index);
+  dest.index = 0;
+  for (auto& [swizzle, entry] : dest.swizzled_views) {
+    if (entry.second) retired_slots_.emplace_back(1, entry.second);
+  }
+  dest.swizzled_views.clear();
+  if (dest.volume_index) retired_slots_.emplace_back(2, dest.volume_index);
+  dest.volume_index = 0;
+}
+
 void Renderer::RetireVolume(Texture& dest) {
   if (!dest.volume) return;
   layouts_.erase(dest.volume.get());
@@ -1707,7 +1729,11 @@ void Renderer::Resolve(const ResolveCall& call) {
   Texture& dest = resolved_[address];
   if (!dest.texture || dest.format != format || dest.width != hostWidth || dest.height < hostHeight) {
     ++texture_generation_;
-    if (dest.texture) RetireResolved(dest);
+    if (dest.texture) {
+      // The draws recorded so far still sample the old texture through its slots: the new one gets its own.
+      RetireResolved(dest);
+      RetireResolvedSlots(dest);
+    }
     dest.texture = device_->createTexture(RenderTextureDesc::ColorTarget(hostWidth, hostHeight, format));
     dest.format = format;
     dest.width = hostWidth;
@@ -2153,6 +2179,7 @@ void Renderer::Draw(const DrawCall& call) {
     // A fetch constant already seen, with no texture changed since.
     const uint8_t* fetchConstant = state.data + xenos::device::kFetchConstants + 24 * slot;
     shared.texExpScale[slot] = TextureExpScale(state, slot);
+    shared.texBias[slot >> 3] |= TextureBiasBits(state, slot) << ((slot & 7) * 4);
     uint32_t words[3];
     std::memcpy(words, fetchConstant, 12);
     SlotBinding& binding = bindings_[((words[0] * 2654435761u) ^ (words[1] * 40503u) ^ words[2]) >> 22];
@@ -2173,10 +2200,7 @@ void Renderer::Draw(const DrawCall& call) {
                         resolved->second.watch_stamp)) {
       // Written by the game since it was resolved: the guest texture now.
       RetireResolved(resolved->second);
-      if (resolved->second.index) retired_slots_.emplace_back(1, resolved->second.index);
-      for (const auto& [swizzle, entry] : resolved->second.swizzled_views) {
-        if (entry.second) retired_slots_.emplace_back(1, entry.second);
-      }
+      RetireResolvedSlots(resolved->second);
       resolved_.erase(resolved);
       resolved = resolved_.end();
       ++texture_generation_;
@@ -2243,6 +2267,9 @@ void Renderer::Draw(const DrawCall& call) {
                                ? StencilFace((depthControl >> 20) & 7, (depthControl >> 23) & 7,
                                              (depthControl >> 26) & 7, (depthControl >> 29) & 7)
                                : desc.stencilFrontFace;
+    // The host's front faces are the clockwise ones, the console's are the counter-clockwise ones when
+    // PA_SU_SC_MODE_CNTL bit 2 is clear.
+    if (!(state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4)) std::swap(desc.stencilFrontFace, desc.stencilBackFace);
   }
   desc.depthClipEnabled = true;
   desc.dynamicDepthBiasEnabled = true;

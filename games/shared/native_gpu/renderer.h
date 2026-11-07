@@ -214,6 +214,7 @@ class Renderer {
   uint32_t ResolvedIndex(Texture& texture, uint32_t swizzle);
   // Releases a resolved texture once the recording frame has completed.
   void RetireResolved(Texture& texture);
+  void RetireResolvedSlots(Texture& texture);
   void RetireVolume(Texture& texture);
   void RefreshVolume(Texture& texture);
 

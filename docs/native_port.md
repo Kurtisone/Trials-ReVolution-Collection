@@ -9,8 +9,8 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, capped at 60 FPS, 12 ms a frame on the renderer thread. Geometry shows in depth and normals; the
-  picture is still white. **These figures are not the game's speed**: base colours and lighting do not work yet.
+* First track: reached, 50 FPS and 19.5 ms a frame on the renderer thread on RADV (Renoir). Base colours, normals, ambient and
+  point lights work; the sun has no light on most surfaces (shadow mask, below), so the picture is dark and flat.
 * Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
   95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
@@ -42,30 +42,56 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
 * The table readback to guest memory (what the CPU reads to know which pages sit where) had red and blue swapped in its
   1_5_5_5 words, and truncated 11 to 10; now the same words as the emulated run's for the common entries (42,000 of 1,048,576 differ, as pages move).
 * `getCompTexLOD` wrote its result to x whatever the destination swizzle; the feedback shaders read it in y.
-* Page draws (BCFF66D9 / 758C4BE0): emulated does about 2,300 in the 1,000 frames after its first 52, native stays at 50 to
-  120 over 7,000 frames. Not found why, and not compared yet with the same scene: the two modes can now reach the same
-  track (below), the feedback and page memory comparison is still to do.
+* Page draws (BCFF66D9 / 758C4BE0), counted over a whole run on Greenhorn's Grove: emulated 52 at the start, then about 2,500
+  in the 2,000 frames after the track begins, and none after; native 64 in all, never more after the first seconds. The
+  feedback decides: at a trace on the track the emulated 256x128 feedback has a request in 99 % of its pixels (alpha 8 to
+  10 mostly), the native one in 30 %, all in a rectangle of the top left 120x64 texels, whatever the viewport (doubling it
+  zooms what is in it, the rectangle stays). Replacing the terrain pixel shader's (C73B91C3) output by a constant fills exactly
+  that rectangle, so it is the terrain draws (VS 23F30886) that cover only that corner; the depth outside it is a smooth ramp
+  from other draws, with zero colour. Not found why (VS constants, the terrain height fetch, or the position of its vertices);
+  the camera of the two traces is not the same frame, but the coverage is far apart anyway.
 * Both modes reach Greenhorn's Grove from a script that waits for screens (scratchpad nav.py: coarse normalised
   front-buffer signatures, Space only on a known menu screen). `native_gpu_observe` now takes the same trace frame as
   the native run (`native_gpu_trace_frame = -1`: the 240th frame of 800+ draws) and writes the front buffer from guest
   memory on `<dump>.trigger`. Guest allocations (so addresses) differ between runs and modes, compare by role.
 * Fixed, shadow side: the shadow mask atlas pass draws 8_8_8_8 stamps into EDRAM tiles that a 16_16 pass cleared;
   those tiles hold the clear word (white), the native 8888 surface started at zero. Clears now leave their raw word per
-  tile and a surface taking over the tiles reads it. The 1_5_5_5 atlas is white like the emulated one. Resolves
+  tile and a surface taking over the tiles reads it. Band 0 of the 1_5_5_5 atlas is white like the emulated one; the others are not (below). Resolves
   landing in the middle of an earlier resolved texture (the atlas is resolved in 512-row bands at tile row offsets)
   now go into that texture instead of a new one at their own address.
 * Fixed: the window scissor (PA_SC_WINDOW_SCISSOR) was ignored; the lighting pass (3743B184) draws a full-screen quad in 16
   strips of 38 rows, each with its own lights and no blending, so each draw overwrote the screen.
-* Still black: with all of that the lighting pass (3743B184) writes about nothing (HDR mean 0.036, max 0.3, against 0.11 and
-  1.8 emulated), also with the stencil test off. Its pixel constants equal the emulated ones. The inputs (depth,
-  normals, albedo, mask, atlas) look right, so a fetch (cube maps t4 / t6, the DXT5A t8 / t14) or an instruction is
-  suspect; compare one pixel by hand or output intermediates.
+* The lighting pass (3743B184) was dark for four reasons, all found by sending intermediate registers to its output
+  (a dev-only replacement of text in the generated HLSL; no longer in the tree):
+  1. Texture heap slots. A resolve to an address that already holds a texture of another size or format (the g-buffer's
+     addresses are reused by the half-size passes later in the frame) made a new texture in the old slot, and the descriptor
+     update applies to every draw of the frame: the lighting pass read albedo, normals and depth as the later resolve
+     (zero). A replaced resolve texture now gets new slots, the old ones free once the frame is done.
+  2. Stencil faces. The host's front faces are clockwise; the console's are counter-clockwise when
+     PA_SU_SC_MODE_CNTL bit 2 is clear, and the full-screen quad that adds one to the stencil (F0D3EFC1 / E9E94D4C) has that
+     bit clear, so its ops fell on the back face's (keep) and the stencil test of the lighting pass (not equal to 0) failed
+     everywhere. The front and back ops swap in that case.
+  3. Fetch constant sign fields: 2 is unsigned biased (`2 * v - 1`) per component; the normal buffer (2_10_10_10, x and y) was
+     read as 0 to 1. `texBias` in the shader, four bits a slot in the shared constants.
+  4. The `cube` instruction was translated as `cube(r)` of its first register, unswizzled. The hardware takes the direction
+     v as v.zzxy and v.yxzz in its two operands; the translation now takes the second operand's `.yxz`.
+  The picture is now lit (albedo, normals, ambient, lights), HDR mean 0.08 to 0.11 with max 2.5 where emulated is 0.13.
+* Still wrong, the sun: its shadow term is 0 on most of the floor and walls. The shadow mask (40768DE1, volume boxes drawn at
+  4x and 1x with stencil ops, resolved as k_8_8) is black on all geometry where the emulated one is white with dark edges, and
+  its input, the 512x2048 1_5_5_5 atlas, has band 0 white, band 1 the clear word (255, 127, 255, 127) and bands 2 and 3 zero
+  where the emulated one is white throughout. Each band is resolved at the right rate (band 0 every frame, 1 every second, 2 and
+  3 every fourth), so what is wrong is what the EDRAM tiles hold when the 8888 stamps draw over them (clears riding on the
+  resolves, the 16_16 pass that clears to white before them) or the stamps themselves. Not found.
+* Tools: the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
+  resolve swaps red and blue. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
+  its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
+  numbered like the native dumps), so a same-moment pair is one `nav.py` run each with `NAV_TRACES`.
 
 Next, in order:
 
-1. The lighting pass above (why it is dark).
-2. Page loading (above), with the same track in both runs.
-3. Frame rate: 48 FPS on the track, 20.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
+1. The sun: the shadow atlas bands and the volume stencil passes (above).
+2. Page loading: why the terrain draws of the feedback pass cover the top left corner only (above).
+3. Frame rate: 50 FPS on the track, 19.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so
@@ -79,7 +105,8 @@ texel coordinates.
 Surfaces marked 4x are drawn at 1x with viewport and pitch doubled. Resolves of 256 KB or less go back to guest memory a frame
 or two later, for the exposure and page request readers.
 
-To see a frame: `native_gpu_trace_frame = -1` logs a track frame and `native_gpu_dump_path` writes each resolve in order.
+To see a frame: `native_gpu_trace_frame = -1` logs a track frame and `native_gpu_dump_path` writes each resolve in order;
+creating `<native_gpu_dump_path>.trace` does it for the next frame, at a moment of your choosing.
 `native_gpu_observe = true` with `native_gpu_present = false` leaves rendering to the plugin and logs the same frame, for comparison.
 `TRACE guest` lines show guest memory at each resolve destination. Screens that go wholly black in tests are a crash or the
 display timing out: use `svc power stayon true` and look at the top activity.

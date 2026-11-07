@@ -82,13 +82,16 @@ struct SharedConstants {
   float posScaleY{1.0f};
   // Fetch constant exponent adjust, and the range of integer formats the host holds normalized.
   float texExpScale[16] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-  uint32_t padding[6]{};
+  // Vertices in window coordinates (PA_CL_VTE_CNTL): scale and offset back into clip space.
+  float screenMul[3] = {1.0f, 1.0f, 1.0f};
+  float screenAdd[3] = {};
   // Memory export: the buffer's address, and the guest ranges it holds (start, end, offset in it).
   uint64_t exportMemory{};
   uint32_t padding2[2]{};
   uint32_t exportRegions[kMaxExportRegions][4]{};
 };
 static_assert(offsetof(SharedConstants, posScaleX) == 288 && offsetof(SharedConstants, texExpScale) == 296 &&
+              offsetof(SharedConstants, screenMul) == 360 && offsetof(SharedConstants, screenAdd) == 372 &&
               offsetof(SharedConstants, exportMemory) == 384 && offsetof(SharedConstants, exportRegions) == 400);
 
 // The factor a fetch multiplies its result by: 2^exponent from fetch constant word 3, and for integer
@@ -442,9 +445,10 @@ void Renderer::WaitFrame(Frame& frame) {
           const auto channel = [&](uint32_t c) {
             const uint16_t h = uint16_t(host[2 * c] | host[2 * c + 1] << 8);
             const uint32_t exponent = (h >> 10) & 31;
-            return exponent ? uint32_t((1024 | (h & 1023)) << exponent >> 25) : 0u;
+            // Rounded: the host holds 11 as 10.99.
+            return exponent ? uint32_t(((uint64_t(1024 | (h & 1023)) << exponent) + (1u << 24)) >> 25) : 0u;
           };
-          const uint32_t red = channel(entry.target.swap_red_blue ? 2 : 0), blue = channel(entry.target.swap_red_blue ? 0 : 2);
+          const uint32_t red = channel(entry.target.swap_red_blue ? 0 : 2), blue = channel(entry.target.swap_red_blue ? 2 : 0);
           const uint16_t value = uint16_t((channel(3) & 1) << 15 | (red & 31) << 10 | (channel(1) & 31) << 5 | (blue & 31));
           if (!value) continue;
           std::memcpy(texel, &value, 2);
@@ -2328,6 +2332,25 @@ void Renderer::Draw(const DrawCall& call) {
   shared.loop17 = state.U32(0x33F4);
   shared.posScaleX = 1.0f / xScale;
   shared.posScaleY = 1.0f / scaleXy;
+  // The clears Fusion draws as rect and point lists carry window coordinates: the viewport transform
+  // below, inverted, with the half pixel it adds taken out.
+  if (const uint32_t vte = state.Reg(xenos::reg::PA_CL_VTE_CNTL); (vte & 0x101) == 0x100) {
+    const float pixelCenter = (state.Reg(xenos::reg::PA_SU_VTX_CNTL) & 1) ? 0.0f : 0.5f;
+    const float scales[2] = {state.RegF(xenos::reg::PA_CL_VPORT_XSCALE), state.RegF(xenos::reg::PA_CL_VPORT_YSCALE)};
+    const float offsets[2] = {state.RegF(xenos::reg::PA_CL_VPORT_XOFFSET), state.RegF(xenos::reg::PA_CL_VPORT_YOFFSET)};
+    const float hostScale[2] = {xScale, scaleXy};
+    for (int axis = 0; axis < 2; ++axis) {
+      if (scales[axis] == 0.0f) continue;
+      shared.screenMul[axis] = 1.0f / scales[axis];
+      shared.screenAdd[axis] = -(offsets[axis] + pixelCenter / hostScale[axis]) / scales[axis];
+    }
+  }
+  if (const uint32_t vte = state.Reg(xenos::reg::PA_CL_VTE_CNTL); (vte & 0x210) == 0x200) {
+    if (const float zScale = state.RegF(xenos::reg::PA_CL_VPORT_ZSCALE); zScale != 0.0f) {
+      shared.screenMul[2] = 1.0f / zScale;
+      shared.screenAdd[2] = -state.RegF(xenos::reg::PA_CL_VPORT_ZOFFSET) / zScale;
+    }
+  }
   if (export_buffer_) shared.exportMemory = export_buffer_->getDeviceAddress();
   for (uint32_t i = 0; i < export_regions_.size(); ++i) {
     const ExportRegion& region = export_regions_[i];

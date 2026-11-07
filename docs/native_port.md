@@ -30,16 +30,32 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
   map they read (32x32 at 1E6DD000) was all zero before, so every block went to the first of its tile. The stale fetch constant
   that looked like a missing 146x146 `k_16` input at slot 4 is not read by any of these shaders.
 
-Next, in order (2026-11-01, track frame traced with `native_gpu_trace_frame = -1`, more than 800 draws):
+Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
 
-1. Albedo `14E11000` is zero though normals are right. Terrain writes `oC0 = colour * t1`, and t1/t2, the 4096x4096 DXT atlases
-   1D261000 and 1C261000, now fill with real terrain pages through memory export, but only as the game asks for pages: about
-   290,000 non zero blocks in the two atlases after 190 s, against 1,048,576 in each under emulation at the end of its page
-   loading, and the terrain still comes out black. Not yet known whether the game asks for fewer pages here (their request
-   reaches it through resolves read back to guest memory) or the terrain's table lookups go wrong.
-2. Destination format 25 with exponent bias 10 (`info=000A6C81`) is resolved to R16G16_UNORM with the bias ignored; the
-   luminance pyramid 150AD000 reads (0, 1), then A8BB5EBB writes zero. Bias is real: it is what makes the table's integers.
-3. With exposure zero the tonemap 3EBCA95D saturates: expect white until 1 and 2 are done.
+* The page request feedback is the 256x128 colour resolve (alpha = mip, page in the other bytes) with its depth, one pass in
+  four, read back like the others; its readback worked. What was empty is the pass: its depth was never cleared. Fusion
+  clears with rect and point lists whose vertices are window coordinates (`PA_CL_VTE_CNTL` = 0x300, only VS 1E6883FC and
+  B6C9863F / DDED7E53 use it) and the depth test is GEQUAL, so the pass only drew while the depth texture was fresh and
+  later passes failed every fragment (colour all zero, no new requests). The renderer now sends those vertices through the
+  inverse of the viewport transform (`g_ScreenMul` / `g_ScreenAdd`, shared constants). The feedback covers what is visible
+  now, about a third of the pixels on the intro camera.
+* The table readback to guest memory (what the CPU reads to know which pages sit where) had red and blue swapped in its
+  1_5_5_5 words, and truncated 11 to 10; now the same words as the emulated run's for the common entries (42,000 of 1,048,576 differ, as pages move).
+* `getCompTexLOD` wrote its result to x whatever the destination swizzle; the feedback shaders read it in y.
+* Page draws (BCFF66D9 / 758C4BE0): emulated does about 2,300 in the 1,000 frames after its first 52, native stays at 50 to
+  120 over 7,000 frames, so the atlases stay at 35,000 to 150,000 blocks of 1,048,576. Not found why. The CPU decision is
+  not the feedback alone: the emulated and native runs reach different tracks with the same key script (emu_front.png is
+  a start line, the native run Greenhorn's Grove), so their feedback cannot be compared yet.
+* Albedo is not the black: with the first frames' pages present the albedo resolve is right and washed out (027 in a trace).
+  The black comes later: the shadow mask 40768DE1 resolves to (0, 0, 1, 0) at 14F42000 and 3743B184 adds the sun only where
+  that mask is above zero. Likely cause, not checked: the 512x2048 1_5_5_5 texture the shadow pass resolves a second time from
+  the same target (info 01000181, read by 40768DE1 as t3) is zero here. Not fixed.
+
+Next, in order:
+
+1. Page loading (above), with the same track in both runs.
+2. The shadow atlas: the 1_5_5_5 resolve of a 16_16 target (info 01000181, FE3B0FE3's pass, c0=000400E0 / 00000340).
+3. Frame rate: 41 FPS on the track, 23.5 ms a frame on the renderer thread (RADV, Renoir), aim 60.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

@@ -1,6 +1,6 @@
 --- a/shader_recompiler.cpp
 +++ b/shader_recompiler.cpp
-@@ -225,6 +225,22 @@
+@@ -225,6 +225,27 @@
  
  void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
  {
@@ -13,17 +13,22 @@
 +
 +    if (instr.opcode == FetchOpcode::GetTextureComputedLod)
 +    {
-+        // The level the hardware would pick, in the destination's x: Fusion hands it to setTexLOD.
-+        indent();
-+        println("r{}.x = compTexLod2D(s{}_Texture2DDescriptorIndex, s{}_SamplerDescriptorIndex, r{}.{}{});", instr.dstRegister,
-+            instr.constIndex, instr.constIndex, instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3], SWIZZLES[(instr.srcSwizzle >> 2) & 0x3]);
++        // The level the hardware would pick, in the destination components that select x: Fusion hands it to setTexLOD.
++        for (size_t i = 0; i < 4; i++)
++        {
++            if (getDestSwizzle(instr.dstSwizzle, i) != FetchDestinationSwizzle::X)
++                continue;
++            indent();
++            println("r{}.{} = compTexLod2D(s{}_Texture2DDescriptorIndex, s{}_SamplerDescriptorIndex, r{}.{}{});", instr.dstRegister, SWIZZLES[i],
++                instr.constIndex, instr.constIndex, instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3], SWIZZLES[(instr.srcSwizzle >> 2) & 0x3]);
++        }
 +        return;
 +    }
 +
      if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
          return;
  
-@@ -326,6 +342,13 @@
+@@ -326,6 +347,13 @@
  
      out += dimension;
  
@@ -37,7 +42,7 @@
  #ifdef UNLEASHED_RECOMP
      if (bicubic)
          out += "Bicubic";
-@@ -338,6 +361,8 @@
+@@ -338,6 +366,8 @@
      {
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
@@ -46,7 +51,7 @@
          break;
      case TextureDimension::TextureCube:
          out += ", cubeMapData";
-@@ -348,6 +373,10 @@
+@@ -348,6 +378,10 @@
  
      printDstSwizzle(instr.dstSwizzle, true);
  
@@ -57,7 +62,7 @@
      out += ";\n";
  
      printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
-@@ -580,7 +609,16 @@
+@@ -580,7 +614,16 @@
      bool closeIfBracket = false;
  
      std::string_view exportRegister;
@@ -75,7 +80,7 @@
      {
          if (isPixelShader)
          {
-@@ -1079,6 +1117,12 @@
+@@ -1079,6 +1122,12 @@
          }
      }
  
@@ -88,7 +93,7 @@
      if (instr.scalarOpcode >= AluScalarOpcode::KillsEq && instr.scalarOpcode <= AluScalarOpcode::KillsOne)
      {
          indent();
-@@ -1191,7 +1235,7 @@
+@@ -1191,7 +1240,7 @@
  
      // Registers the code reads that no constant table entry covers (EA's
      // shaders use raw registers next to named constants): plain loads.
@@ -97,7 +102,7 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
-@@ -1357,10 +1401,10 @@
+@@ -1357,10 +1406,10 @@
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
  
@@ -109,7 +114,7 @@
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
-@@ -1439,6 +1483,15 @@
+@@ -1439,6 +1488,15 @@
  
      bool printedRegisters[32]{};
  
@@ -125,7 +130,7 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
-@@ -1483,14 +1536,14 @@
+@@ -1483,14 +1541,14 @@
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -145,7 +150,7 @@
              else
              {
                  out += "0.0;\n";
-@@ -1500,6 +1553,8 @@
+@@ -1500,6 +1558,8 @@
  
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
@@ -154,7 +159,7 @@
      out += "\tbool p0 = false;\n";
      out += "\tfloat ps = 0.0;\n";
      if (isPixelShader)
-@@ -1634,6 +1689,15 @@
+@@ -1634,6 +1694,15 @@
  
              switch (cfInstr.opcode)
              {
@@ -170,7 +175,7 @@
              case ControlFlowOpcode::Exec:
              case ControlFlowOpcode::ExecEnd:
                  address = cfInstr.exec.address;
-@@ -1813,6 +1877,9 @@
+@@ -1813,6 +1882,9 @@
  
              if (shouldReturn)
              {
@@ -180,7 +185,16 @@
                  if (isPixelShader)
                  {
                      specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
-@@ -1904,4 +1971,13 @@
+@@ -1851,6 +1923,8 @@
+                     if (!hasMtxProjection)
+                 #endif
+                     {
++                        // Vertices in window coordinates (PA_CL_VTE_CNTL) are put back through the viewport transform.
++                        out += "\toPos.xyz = oPos.xyz * g_ScreenMul + g_ScreenAdd * oPos.w;\n";
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     }
+                 }
+@@ -1904,4 +1978,13 @@
  #endif
  
      out += "}";
@@ -196,11 +210,13 @@
  }
 --- a/shader_common.h
 +++ b/shader_common.h
-@@ -32,6 +32,12 @@
+@@ -32,6 +32,14 @@
  #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
 +#define g_PosScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288)
++#define g_ScreenMul                vk::RawBufferLoad<float3>(g_PushConstants.SharedConstants + 360)
++#define g_ScreenAdd                vk::RawBufferLoad<float3>(g_PushConstants.SharedConstants + 372)
 +#define g_TexExpScale(i)           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 296 + (i) * 4)
 +// Memory export: the buffer that holds the exported guest memory, and its regions (guest start and end in bytes, offset).
 +#define g_ExportMemory             vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 384)
@@ -209,7 +225,17 @@
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -67,6 +73,175 @@
+@@ -45,6 +53,9 @@
+     float2 g_HalfPixelOffset : packoffset(c16.z); \
+     float g_AlphaThreshold : packoffset(c17.x);
+ 
++#define g_ScreenMul float3(1.0, 1.0, 1.0)
++#define g_ScreenAdd float3(0.0, 0.0, 0.0)
++
+ uint g_SpecConstants();
+ 
+ #endif
+@@ -67,6 +78,175 @@
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  

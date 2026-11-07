@@ -115,8 +115,10 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   range and the picture is as bright. Every shader with an else gains from it (xenosrecomp.patch). The k_16_FLOAT resolve and
   `WaitFrame`'s copy were right.
 * Tools (also `tbl.py`: page table levels, emulated against native; `tblmask.py`: one level as a mask side by side; `tat.sh`: a
-  native run traced once N s after the track starts): the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
-  resolve swaps red and blue. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
+  native run traced once N s after the track starts): the emulated front buffer was decoded as A, R, G, B (the red tint), then as R, G, B, A (red and blue swapped: hologram
+  cyan, rider yellow, floor yellow-green). Memory holds R, G, B, A (resolve copy info 0x100000: no swap, no endian) but the game
+  presents it through fetch constant 0 with swizzle z, y, x, so the picture is B, G, R: `DumpGuestFrontBuffer` now does that,
+  and hues match native (orange sign, blue rider). The emulated side still has its green tint; native is the paler of the two. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
   its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
   numbered like the native dumps), so a same-moment pair is one `nav.py` run each with `NAV_TRACES`.
 
@@ -140,7 +142,7 @@ Next, in order:
 
 1. Frame rate: 45 FPS on the track, 22 ms a frame on the renderer thread (RADV, Renoir; 51 and 19 before the floor was textured),
    aim 60. The EDRAM stale-tile clear ran 155,000 times in one 110 s run ("EDRAM: color target overwritten by another surface").
-2. The emulated front buffer in `side.py` pairs shows a green and yellow tint, so colours are not compared yet.
+2. Colours: the pair hues agree now (see the tools note above); the emulated green tint and native's paler picture (no grade difference found yet) are left.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

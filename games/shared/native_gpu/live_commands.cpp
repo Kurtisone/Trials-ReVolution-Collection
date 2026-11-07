@@ -910,9 +910,11 @@ void DumpGuestFrontBuffer(uint32_t address) {
     for (uint32_t x = 0; x < kWidth; ++x) {
       const uint8_t* pixel = source + xenos::TiledOffset2D(int32_t(x), int32_t(y), kWidth, 2);
       uint8_t* out = &rgba[(y * kWidth + x) * 4];
-      out[0] = pixel[0];  // the front buffer's resolve swaps red and blue: R, G, B, A in memory order
+      // The resolve has no swap bit and memory holds R, G, B, A, but the game presents it through a swizzle of z, y, x
+      // (fetch constant 0 at the swap), so what is shown is B, G, R.
+      out[0] = pixel[2];
       out[1] = pixel[1];
-      out[2] = pixel[2];
+      out[2] = pixel[0];
       out[3] = 0xFF;
     }
   }

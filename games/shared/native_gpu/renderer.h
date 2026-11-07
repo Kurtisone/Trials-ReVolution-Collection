@@ -50,6 +50,13 @@ struct DrawCall {
   // BeginVertices / EndVertices: the vertices written into the command buffer.
   const uint8_t* inline_vertices = nullptr;
   uint32_t inline_size = 0;
+  // Memory export: the guest ranges the shaders' streams write (physical address, bytes).
+  static constexpr uint32_t kMaxExports = 4;
+  struct ExportRange {
+    uint32_t address = 0, size = 0;
+  };
+  ExportRange exports[kMaxExports];
+  uint32_t export_count = 0;
 };
 
 // ClearF(flags, rect, color): flags 0xF color targets, 0x10 depth, 0x20 stencil.
@@ -198,6 +205,7 @@ class Renderer {
     uint32_t resolved_size = 0;  // the guest memory a resolve writes
     uint64_t content_hash = 0;   // guest textures, NATIVE_GPU_VERIFY_TEXTURES
     uint32_t watch_stamp = 0;    // guest and resolved textures: WriteWatcher::Watch's
+    uint32_t export_generation = 0;  // textures laid out from memory export: the region's, when they were
   };
   uint32_t ResolvedIndex(Texture& texture, uint32_t swizzle);
   // Releases a resolved texture once the recording frame has completed.
@@ -207,6 +215,20 @@ class Renderer {
 
   Shader* GetShader(uint64_t key);
   Texture* GetGuestTexture(const xenos::TextureFetch& fetch);
+  // Memory export writes the guest memory of its ranges into a buffer of the GPU's, where the draws
+  // that follow find it: textures are laid out from it by a compute shader, in place of guest memory.
+  struct ExportRegion {
+    uint32_t begin = 0, end = 0;  // guest physical, 4 KB pages
+    uint32_t offset = 0;          // in the export buffer
+    uint32_t generation = 0;      // changes with each export into the region
+  };
+  void AddExportRange(uint32_t address, uint32_t size);
+  void InitializeExportRegion(const ExportRegion& region);
+  // Orders the export buffer's uses: the draws that wrote it, the compute shader that reads it.
+  void ExportBarrier();
+  ExportRegion* FindExportRegion(uint32_t address);
+  Texture* GetExportTexture(const xenos::TextureFetch& fetch, const ExportRegion& region, Texture& texture,
+                            bool inserted);
   // A guest vertex or index buffer converted to host order by `convert`.
   const plume::RenderBuffer* GetGuestBuffer(uint32_t address, uint32_t size, uint64_t layout,
                                             const std::function<void(uint8_t*)>& convert);
@@ -243,6 +265,15 @@ class Renderer {
   const uint8_t* physical_ = nullptr;
   std::function<const uint8_t*(uint64_t)> container_;
   std::vector<uint8_t> spirv_;
+  std::unique_ptr<plume::RenderBuffer> export_buffer_;
+  std::vector<ExportRegion> export_regions_;
+  uint32_t export_used_ = 0, export_generation_ = 0;
+  // Linear blocks laid out from the export buffer, on their way to a texture.
+  std::unique_ptr<plume::RenderBuffer> export_scratch_;
+  uint64_t export_scratch_size_ = 0;
+  std::unique_ptr<plume::RenderPipelineLayout> detile_layout_;
+  std::unique_ptr<plume::RenderShader> detile_cs_;
+  std::unique_ptr<plume::RenderPipeline> detile_pipeline_;
 
   // Frames in flight: the game's render thread records frame N while the GPU
   // runs frame N-1. Each slot owns what its commands use.

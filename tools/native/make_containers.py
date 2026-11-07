@@ -88,9 +88,6 @@ def main():
     for fields in meta:
         kind, name = fields[0], fields[1]
         info = dict(f.split('=', 1) for f in fields if '=' in f)
-        if info['memexport'] != '0':
-            skipped += 1
-            continue
         raw = open(os.path.join(source, f'{name}.{kind}'), 'rb').read()
         words = list(struct.unpack(f'<{len(raw) // 4}I', raw))
         code = struct.pack(f'>{len(words)}I', *words)

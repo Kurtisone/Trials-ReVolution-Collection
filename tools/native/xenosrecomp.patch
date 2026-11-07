@@ -57,7 +57,38 @@
      out += ";\n";
  
      printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
-@@ -1191,7 +1220,7 @@
+@@ -580,7 +609,16 @@
+     bool closeIfBracket = false;
+ 
+     std::string_view exportRegister;
+-    if (instr.exportData)
++    // Memory export: the address (eA) and up to five elements (eM0 to eM4), stored by memExport.
++    const bool memoryExport = instr.exportData && instr.vectorDest >= uint32_t(ExportRegister::ExportAddress) &&
++        instr.vectorDest <= uint32_t(ExportRegister::ExportData4);
++    if (memoryExport)
++    {
++        static constexpr const char* MEMORY_EXPORT_REGISTERS[] = { "eA", "eM0", "eM1", "eM2", "eM3", "eM4" };
++        exportRegister = MEMORY_EXPORT_REGISTERS[instr.vectorDest - uint32_t(ExportRegister::ExportAddress)];
++        usesMemoryExport = true;
++    }
++    else if (instr.exportData)
+     {
+         if (isPixelShader)
+         {
+@@ -1079,6 +1117,12 @@
+         }
+     }
+ 
++    if (memoryExport && instr.vectorDest != uint32_t(ExportRegister::ExportAddress) && (instr.vectorWriteMask | instr.scalarWriteMask) != 0)
++    {
++        indent();
++        println("eMw |= {}u;", 1u << (instr.vectorDest - uint32_t(ExportRegister::ExportData0)));
++    }
++
+     if (instr.scalarOpcode >= AluScalarOpcode::KillsEq && instr.scalarOpcode <= AluScalarOpcode::KillsOne)
+     {
+         indent();
+@@ -1191,7 +1235,7 @@
  
      // Registers the code reads that no constant table entry covers (EA's
      // shaders use raw registers next to named constants): plain loads.
@@ -66,7 +97,7 @@
      for (uint32_t i = 0; i < float4RegisterCount; i++)
      {
          if (float4Constants.count(i) == 0)
-@@ -1357,10 +1386,10 @@
+@@ -1357,10 +1401,10 @@
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
  
@@ -78,7 +109,7 @@
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
      #endif
-@@ -1439,6 +1468,15 @@
+@@ -1439,6 +1483,15 @@
  
      bool printedRegisters[32]{};
  
@@ -94,7 +125,7 @@
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
      for (uint32_t i = 0; i < interpolatorCount; i++)
-@@ -1483,14 +1521,14 @@
+@@ -1483,14 +1536,14 @@
              print("\tfloat4 r{} = ", i);
              if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
              {
@@ -114,29 +145,220 @@
              else
              {
                  out += "0.0;\n";
-@@ -1500,6 +1538,7 @@
+@@ -1500,6 +1553,8 @@
  
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
 +    out += "\tfloat texLod = 0.0;\n";
++    out += "//@MEMORY_EXPORT_DECLARATIONS\n";
      out += "\tbool p0 = false;\n";
      out += "\tfloat ps = 0.0;\n";
      if (isPixelShader)
+@@ -1634,6 +1689,15 @@
+ 
+             switch (cfInstr.opcode)
+             {
++            case ControlFlowOpcode::Alloc:
++                // A new memory export allocation stores the elements written for the one before.
++                if (cfInstr.alloc.allocType == 3)
++                {
++                    indent();
++                    out += "//@MEMORY_EXPORT_STORE\n";
++                }
++                break;
++
+             case ControlFlowOpcode::Exec:
+             case ControlFlowOpcode::ExecEnd:
+                 address = cfInstr.exec.address;
+@@ -1813,6 +1877,9 @@
+ 
+             if (shouldReturn)
+             {
++                indent();
++                out += "//@MEMORY_EXPORT_STORE\n";
++
+                 if (isPixelShader)
+                 {
+                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+@@ -1904,4 +1971,13 @@
+ #endif
+ 
+     out += "}";
++
++    // Shaders without memory export carry none of it.
++    const auto replaceAll = [&](const std::string& marker, const std::string& text)
++    {
++        for (size_t at = out.find(marker); at != std::string::npos; at = out.find(marker, at + text.size()))
++            out.replace(at, marker.size(), text);
++    };
++    replaceAll("//@MEMORY_EXPORT_DECLARATIONS", usesMemoryExport ? "\tfloat4 eA = 0.0;\n\tfloat4 eM0 = 0.0, eM1 = 0.0, eM2 = 0.0, eM3 = 0.0, eM4 = 0.0;\n\tuint eMw = 0;" : "");
++    replaceAll("//@MEMORY_EXPORT_STORE", usesMemoryExport ? "if (eMw != 0) { memExport(eA, eM0, eM1, eM2, eM3, eM4, eMw); eMw = 0; }" : "");
+ }
 --- a/shader_common.h
 +++ b/shader_common.h
-@@ -32,6 +32,8 @@
+@@ -32,6 +32,12 @@
  #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
  #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
  #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
 +#define g_PosScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 288)
 +#define g_TexExpScale(i)           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 296 + (i) * 4)
++// Memory export: the buffer that holds the exported guest memory, and its regions (guest start and end in bytes, offset).
++#define g_ExportMemory             vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 384)
++#define g_ExportRegions            (g_PushConstants.SharedConstants + 400)
++#define EXPORT_REGION_COUNT        8
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -67,6 +69,29 @@
+@@ -67,6 +73,175 @@
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  
++#ifdef __spirv__
++
++// Memory export, as the SDK's translator does it: eA holds the stream (base address, index, format, count) in the
++// bits of a float4, eM0 to eM4 the elements, written in the format and byte order the stream names.
++uint exportSwap(uint v, uint endian)
++{
++    if (endian == 1)
++        return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
++    if (endian == 2 || endian >= 4)
++        return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
++    if (endian == 3)
++        return (v << 16) | (v >> 16);
++    return v;
++}
++
++uint4 exportSwap128(uint4 v, uint endian)
++{
++    if (endian == 4)
++        v = v.yxwz;
++    else if (endian == 5)
++        v = v.wzyx;
++    return uint4(exportSwap(v.x, endian), exportSwap(v.y, endian), exportSwap(v.z, endian), exportSwap(v.w, endian));
++}
++
++// The element as dwords; log2Size is its size in bytes (7 when the format is not one memory export takes).
++uint4 exportPack(float4 v, uint format, bool swapRedBlue, bool isSigned, bool isNorm, out uint log2Size)
++{
++    if (swapRedBlue)
++        v = v.zyxw;
++    uint4 widths = 0;
++    log2Size = 2;
++    switch (format)
++    {
++    case 2: case 8: case 9: widths = uint4(8, 0, 0, 0); log2Size = 0; break;
++    case 3: widths = uint4(5, 5, 5, 1); log2Size = 1; break;
++    case 4: widths = uint4(5, 6, 5, 0); log2Size = 1; break;
++    case 5: widths = uint4(5, 5, 6, 0); log2Size = 1; break;
++    case 6: case 14: case 50: widths = uint4(8, 8, 8, 8); break;
++    case 7: case 54: widths = uint4(10, 10, 10, 2); break;
++    case 10: widths = uint4(8, 8, 0, 0); log2Size = 1; break;
++    case 15: widths = uint4(4, 4, 4, 4); log2Size = 1; break;
++    case 16: case 55: widths = uint4(11, 11, 10, 0); break;
++    case 17: case 56: widths = uint4(10, 11, 11, 0); break;
++    case 24: widths = uint4(16, 0, 0, 0); log2Size = 1; break;
++    case 25: widths = uint4(16, 16, 0, 0); break;
++    case 26: widths = uint4(16, 16, 16, 16); log2Size = 3; break;
++    case 30: log2Size = 1; return uint4(f32tof16(v.x), 0, 0, 0);
++    case 31: log2Size = 2; return uint4(f32tof16(v.x) | (f32tof16(v.y) << 16), 0, 0, 0);
++    case 32: log2Size = 3; return uint4(f32tof16(v.x) | (f32tof16(v.y) << 16), f32tof16(v.z) | (f32tof16(v.w) << 16), 0, 0);
++    case 36: log2Size = 2; return uint4(asuint(v.x), 0, 0, 0);
++    case 37: log2Size = 3; return uint4(asuint(v.x), asuint(v.y), 0, 0);
++    case 38: log2Size = 4; return asuint(v);
++    default: log2Size = 7; return 0;
++    }
++    uint4 packed = 0;
++    uint offset = 0;
++    for (uint c = 0; c < 4; ++c)
++    {
++        uint width = widths[c];
++        if (width == 0)
++            break;
++        float f = isnan(v[c]) ? 0.0 : v[c];
++        uint bits;
++        if (isSigned)
++        {
++            if (isNorm)
++                f = clamp(f, -1.0, 1.0) * float((1u << (width - 1)) - 1);
++            bits = uint(int(f + (f < 0.0 ? -0.5 : 0.5)));
++        }
++        else
++        {
++            if (isNorm)
++                f = saturate(f) * float((1u << width) - 1);
++            bits = uint(max(f, 0.0) + 0.5);
++        }
++        bits &= (1u << width) - 1;
++        // Two 16-bit components share each dword.
++        uint dword = log2Size == 3 ? c / 2 : 0;
++        uint shift = log2Size == 3 ? (c & 1) * 16 : offset;
++        packed[dword] |= bits << shift;
++        offset += width;
++    }
++    return packed;
++}
++
++// Where a guest address (and the bytes after it) are in the export buffer, 0 outside every region.
++uint64_t exportAddress(uint address, uint size)
++{
++    [unroll]
++    for (uint i = 0; i < EXPORT_REGION_COUNT; ++i)
++    {
++        uint4 region = vk::RawBufferLoad<uint4>(g_ExportRegions + i * 16);
++        if (address >= region.x && address + size <= region.y)
++            return g_ExportMemory + region.z + (address - region.x);
++    }
++    return 0;
++}
++
++void memExport(float4 eA, float4 eM0, float4 eM1, float4 eM2, float4 eM3, float4 eM4, uint written)
++{
++    uint4 stream = asuint(eA);
++    // The hardware validates the upper bits of the stream.
++    if (any((stream >> uint4(30, 23, 23, 23)) != uint4(1, 0x96, 0x96, 0x96)))
++        return;
++    uint info = stream.z;
++    uint endian = info & 7;
++    uint format = (info >> 8) & 63;
++    bool isSigned = (info & (1u << 16)) != 0;
++    bool isNorm = (info & (1u << 17)) == 0;
++    bool swapRedBlue = (info & (1u << 19)) != 0;
++    uint index = stream.y & 0x7FFFFF;
++    uint count = stream.w & 0x7FFFFF;
++    // Elements past the end of the stream are not stored.
++    uint remaining = uint(clamp(int(count) - int(index), 0, 5));
++    float4 elements[5] = { eM0, eM1, eM2, eM3, eM4 };
++    [unroll]
++    for (uint i = 0; i < 5; ++i)
++    {
++        if ((written & (1u << i)) == 0 || i >= remaining)
++            continue;
++        uint log2Size;
++        uint4 value = exportSwap128(exportPack(elements[i], format, swapRedBlue, isSigned, isNorm, log2Size), endian);
++        if (log2Size > 4)
++            continue;
++        uint address = (stream.x << 2) + ((index + i) << log2Size);
++        uint64_t target = exportAddress(address, 1u << log2Size);
++        if (target == 0)
++            continue;
++        if (log2Size < 2)
++        {
++            // Part of a dword: the rest is kept.
++            uint shift = (address & (log2Size == 0 ? 3 : 2)) * 8;
++            uint64_t dword = target - (address & 3);
++            uint mask = (log2Size == 0 ? 0xFFu : 0xFFFFu) << shift;
++            vk::RawBufferStore<uint>(dword, (vk::RawBufferLoad<uint>(dword) & ~mask) | ((value.x << shift) & mask));
++        }
++        else
++        {
++            for (uint d = 0; d < (1u << (log2Size - 2)); ++d)
++                vk::RawBufferStore<uint>(target + d * 4, value[d]);
++        }
++    }
++}
++
++#endif
++
 +// A level the shader picked (setTexLOD), and texel rather than normalized coordinates.
 +float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod, bool denormalized)
 +{
@@ -163,3 +385,13 @@
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+--- a/shader_recompiler.h
++++ b/shader_recompiler.h
+@@ -27,6 +27,7 @@
+ {
+     uint32_t indentation = 0;
+     bool isPixelShader = false;
++    bool usesMemoryExport = false;
+     const uint8_t* constantTableData = nullptr;
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;

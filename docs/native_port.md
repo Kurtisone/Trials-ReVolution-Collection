@@ -16,11 +16,27 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
 * `getCompTexLOD` was dropped by XenosRecomp, so setTexLOD got a stale register; fixed in tools/native/xenosrecomp.patch.
 
+* Memory export: **runs natively**. XenosRecomp emits `eA`/`eM0..4` and a `memExport` call at each `alloc export` and at the
+  end of the shader (SDK translator's format packing and byte order, `shader_common.h`); the stores go through buffer
+  device addresses into one 128 MB buffer of the renderer's, which holds the guest ranges the draws' streams name
+  (`mad eA, r#, c0100, c#`: the CPU reads the stream constant at each draw, as the SDK's `AddMemExportRanges` does, and the
+  renderer keeps those pages, filled from guest memory the first time). Nothing is written back to guest memory: the
+  plugin's `readback_memexport` is off by default and the emulated game works without it. A texture fetched from such a
+  range is laid out from the buffer by a compute shader (`shaders/detile.hlsl`) and copied into its image, in place, when an
+  export has written the range since. So the frame is not rendered and read back for these draws any more. The plugin way is
+  `native_gpu_memexport_plugin = true` (needs `readback_memexport = true` for the textures to see the result). The atlases
+  hold 8-byte `k_16_16_16_16` unsigned elements, two for each DXT5 block, one block in each 16 KB tile of the atlas for each
+  draw (BCFF66D9 copies a page, 758C4BE0 compresses one). `k_16` integer fetches now get the 65535 scale: the page index
+  map they read (32x32 at 1E6DD000) was all zero before, so every block went to the first of its tile. The stale fetch constant
+  that looked like a missing 146x146 `k_16` input at slot 4 is not read by any of these shaders.
+
 Next, in order (2026-11-01, track frame traced with `native_gpu_trace_frame = -1`, more than 800 draws):
 
 1. Albedo `14E11000` is zero though normals are right. Terrain writes `oC0 = colour * t1`, and t1/t2, the 4096x4096 DXT atlases
-   1D261000 and 1C261000, read as zero in guest memory. Nothing yet says what fills them. Lead, unproven: the memory export
-   shaders not in the cache (BCFF66D9, 758C4BE0, DDED7E53, 6E11F29E, 1EDA3CCD), which go to the plugin.
+   1D261000 and 1C261000, now fill with real terrain pages through memory export, but only as the game asks for pages: about
+   290,000 non zero blocks in the two atlases after 190 s, against 1,048,576 in each under emulation at the end of its page
+   loading, and the terrain still comes out black. Not yet known whether the game asks for fewer pages here (their request
+   reaches it through resolves read back to guest memory) or the terrain's table lookups go wrong.
 2. Destination format 25 with exponent bias 10 (`info=000A6C81`) is resolved to R16G16_UNORM with the bias ignored; the
    luminance pyramid 150AD000 reads (0, 1), then A8BB5EBB writes zero. Bias is real: it is what makes the table's integers.
 3. With exposure zero the tonemap 3EBCA95D saturates: expect white until 1 and 2 are done.
@@ -44,12 +60,8 @@ display timing out: use `svc power stayon true` and look at the top activity.
 
 What is left, in order:
 
-1. Base colours. The virtual texture table's mip levels (2 to 3 MB from `mip_address`) are all zero here against 92,794 non zero
-   words under emulation; its base level is empty in both. Those levels copy themselves (`6398EA`, `95BB84`, explicit level
-   fetches), so they need a seed, and `native_gpu_observe` shows it: pixel shader `BCFF66D9` with vertex shader `0B97B324`, and
-   vertex shader `DDED7E53`, 52 draws each as the table fills. All are memory export, so they run on the plugin, but with
-   `readback_memexport = true` and `readback_memexport_fast = false` the table is still zero in guest memory. Next: find out
-   whether those draws run at all on the native path and where they write, or run the export natively (`BCFF` is 42 dwords).
+1. Base colours: see the first item above. `DDED7E53` and `B4C1B91D` (small, not memory export) draw while the table fills and
+   were not in the dump the shader cache was built from; they are in it now.
 2. Rect lists (primitive 8) are skipped.
 3. Frame pacing: `native_gpu_frame_limit` holds 60, without a real vertical blank.
 4. Early present: races on the fence at high frame rates, off by default.
@@ -75,8 +87,8 @@ So the input to a shader recompiler has to be raw microcode, captured or read fr
 a container would have said (constants, interpolators, vertex layout) worked out from the microcode. XenosRecomp would need
 that as a new input path, or the SDK's own microcode to SPIR-V translator could feed the native renderer instead.
 
-Of 92 shaders seen from the menus to the first track, 4 use memory export. Neither XenosRecomp nor the native renderer
-handle it, and the virtual textures depend on it.
+Of 92 shaders seen from the menus to the first track, 4 use memory export, which the virtual textures depend on; the
+native renderer handles it now (see the current state).
 
 ## D3D entry points
 
@@ -212,6 +224,6 @@ Native work left, if taken up:
 0. Move the native renderer's entry to the command stream: take draws from the SDK's `IssueDraw`, keep the render targets simple.
 2. Shaders: the raw microcode, for the whole set, through the SDK's translator.
 3. Render the title screen from a frame capture.
-4. Memory export: the deciding step, without which tracks have no textures.
+4. Memory export: done natively, see the current state.
 
 To find what writes a buffer: attach gdb once in game, `watch -l` on the guest address + `0x1A0000000`.

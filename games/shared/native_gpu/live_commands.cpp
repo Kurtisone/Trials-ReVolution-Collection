@@ -62,6 +62,8 @@ REXCVAR_DEFINE_STRING(native_gpu_dump_addresses, "", "GPU",
                       "Resolved textures to write with the traced frame, comma separated hexadecimal");
 REXCVAR_DEFINE_BOOL(native_gpu_observe, false, "GPU", "Leave rendering to the emulated GPU, for trace comparisons");
 REXCVAR_DEFINE_INT32(native_gpu_frame_limit, 60, "GPU", "Frames per second at most, 0 for none");
+REXCVAR_DEFINE_BOOL(native_gpu_memexport_plugin, false, "GPU",
+                    "Leave memory export draws to the emulated GPU, after rendering the frame so far for it");
 REXCVAR_DEFINE_INT32(native_gpu_trace_frame, 0, "GPU", "Log the commands of this frame");
 REXCVAR_DEFINE_STRING(native_gpu_dump_path, "native_frame.ppm", "GPU",
                       "Creating <path>.trigger writes the next front buffer here");
@@ -570,6 +572,7 @@ size_t SnapshotState(const uint32_t* regs) {
 struct KnownShader {
   uint64_t key = 0;  // 0: not in the shader cache
   bool memexport = false;
+  std::vector<uint32_t> streams;  // float constants the shader's memory export streams come from
   std::vector<uint8_t> big_endian;
 };
 
@@ -587,6 +590,33 @@ bool WritesMemory(const uint32_t* ucode, uint32_t dwords) {
   }
   return false;
 }
+// The float constants memory export streams are set from: the ALU instructions of the exec clauses
+// that write the export address with `mad eA, r#, c0100, c#`.
+std::vector<uint32_t> MemoryExportStreams(const uint32_t* ucode, uint32_t dwords) {
+  std::vector<uint32_t> streams;
+  uint32_t limit = dwords / 3 * 2;
+  for (uint32_t i = 0; i < limit; ++i) {
+    const uint32_t* triple = ucode + i / 2 * 3;
+    const uint32_t word0 = i % 2 ? triple[1] >> 16 | triple[2] << 16 : triple[0];
+    const uint32_t word1 = i % 2 ? triple[2] >> 16 : triple[1] & 0xFFFF;
+    const uint32_t opcode = word1 >> 12;
+    if (opcode >= 1 && opcode <= 7) limit = std::min(limit, (word0 & 0x1FF) * 2);
+    if ((opcode < 1 || opcode > 6) && opcode != 13 && opcode != 14) continue;
+    const uint32_t address = word0 & 0xFFF, count = (word0 >> 12) & 7, sequence = (word0 >> 16) & 0xFFF;
+    for (uint32_t j = 0; j < count; ++j) {
+      if ((sequence >> (2 * j)) & 1 || (address + j) * 3 + 2 >= dwords) continue;  // a fetch
+      const uint32_t* alu = ucode + (address + j) * 3;
+      constexpr uint32_t kExportAddress = 32, kMad = 11;
+      const bool exports = (alu[0] >> 15) & 1, constant = !((alu[2] >> 29) & 1);
+      if (exports && (alu[0] & 0x3F) == kExportAddress && ((alu[2] >> 24) & 0x1F) == kMad && constant) {
+        const uint32_t index = alu[2] & 0xFF;
+        if (std::find(streams.begin(), streams.end(), index) == streams.end()) streams.push_back(index);
+      }
+    }
+  }
+  return streams;
+}
+
 std::unordered_map<uint64_t, KnownShader> g_shaders;
 std::mutex g_container_mutex;
 std::unordered_map<uint64_t, const uint8_t*> g_containers;
@@ -598,6 +628,7 @@ const KnownShader& FindShader(uint64_t hash, const uint32_t* ucode, uint32_t dwo
     shader.big_endian.resize(dwords * 4);
     for (uint32_t i = 0; i < dwords; ++i) StoreBE32(&shader.big_endian[i * 4], ucode[i]);
     shader.memexport = WritesMemory(ucode, dwords);
+    if (shader.memexport) shader.streams = MemoryExportStreams(ucode, dwords);
     const uint64_t key = XXH3_64bits(shader.big_endian.data(), shader.big_endian.size());
     const ShaderCacheEntry* begin = g_shaderCacheEntries;
     const ShaderCacheEntry* end = begin + g_shaderCacheEntryCount;
@@ -636,13 +667,38 @@ void SyncRenderer() {
   g_queue_cv.wait(lock, [] { return !g_queued.has_value() && !g_busy; });
 }
 
+// Bytes of one element a memory export stream writes in a colour format, 0 for those it does not take.
+uint32_t ExportElementBytes(uint32_t format) {
+  switch (format) {
+    case 2: case 8: case 9: return 1;
+    case 3: case 4: case 5: case 10: case 15: case 24: case 30: return 2;
+    case 6: case 7: case 14: case 16: case 17: case 25: case 31: case 36: case 50: case 54: case 55: case 56: return 4;
+    case 26: case 32: case 37: return 8;
+    case 38: return 16;
+    default: return 0;
+  }
+}
+
+// The guest ranges a draw's memory export streams write (draw_util::AddMemExportRanges).
+void AddExportRanges(const KnownShader& shader, const uint32_t* constants, native_gpu::DrawCall& call) {
+  for (uint32_t index : shader.streams) {
+    const uint32_t* stream = constants + 4 * index;
+    // The hardware validates the upper bits of the stream.
+    if ((stream[0] >> 30) != 1 || (stream[2] >> 20) != 0x4B0 || (stream[3] >> 23) != 0x96) continue;
+    const uint32_t count = stream[3] & 0x7FFFFF, bytes = ExportElementBytes((stream[2] >> 8) & 0x3F);
+    if (!count || !bytes || call.export_count == native_gpu::DrawCall::kMaxExports) continue;
+    call.exports[call.export_count++] = {(stream[0] << 2) & 0x1FFFFFFF, count * bytes};
+  }
+}
+
 uint32_t g_trace_index = 0;
 bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   if (!event.vs_ucode) return true;
   const KnownShader& vertex = FindShader(event.vs_hash, event.vs_ucode, event.vs_dwords);
   const KnownShader* pixel = event.ps_ucode ? &FindShader(event.ps_hash, event.ps_ucode, event.ps_dwords) : nullptr;
-  // Memory export draws have no native form: the plugin runs them.
-  if (vertex.memexport || (pixel && pixel->memexport)) {
+  // Memory export writes into the renderer's own buffer; the plugin's way needs the frame so far in guest memory.
+  if ((vertex.memexport || (pixel && pixel->memexport)) &&
+      (REXCVAR_GET(native_gpu_memexport_plugin) || !vertex.key || (pixel && !pixel->key))) {
     SyncRenderer();
     return false;
   }
@@ -654,6 +710,8 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   call.vs_physical_size = uint32_t(vertex.big_endian.size());
   call.primitive = event.primitive;
   call.count = event.count;
+  AddExportRanges(vertex, event.registers + kRegFloatConstants, call);
+  if (pixel) AddExportRanges(*pixel, event.registers + kRegFloatConstants + 256 * 4, call);
   call.base_vertex = event.registers[0x2102];  // VGT_INDX_OFFSET
   if (event.indexed) {
     call.indices_address = event.index_address;

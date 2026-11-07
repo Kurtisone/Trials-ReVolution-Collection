@@ -35,6 +35,9 @@ constexpr uint32_t kTextureHeapSize = 8192;
 constexpr uint32_t kSamplerHeapSize = 256;
 // Largest EDRAM surface height: 10 MB of EDRAM.
 constexpr uint32_t kMaxSurfaceHeight = 2048;
+// Memory export: guest ranges kept in one buffer, and its size.
+constexpr uint32_t kMaxExportRegions = 8;
+constexpr uint32_t kExportBufferSize = 128u << 20;
 
 // The game's interface: its shaders keep their 16:9 place on wider pictures.
 constexpr uint64_t kInterfaceVertexShaders[] = {
@@ -79,8 +82,14 @@ struct SharedConstants {
   float posScaleY{1.0f};
   // Fetch constant exponent adjust, and the range of integer formats the host holds normalized.
   float texExpScale[16] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+  uint32_t padding[6]{};
+  // Memory export: the buffer's address, and the guest ranges it holds (start, end, offset in it).
+  uint64_t exportMemory{};
+  uint32_t padding2[2]{};
+  uint32_t exportRegions[kMaxExportRegions][4]{};
 };
-static_assert(offsetof(SharedConstants, posScaleX) == 288 && offsetof(SharedConstants, texExpScale) == 296);
+static_assert(offsetof(SharedConstants, posScaleX) == 288 && offsetof(SharedConstants, texExpScale) == 296 &&
+              offsetof(SharedConstants, exportMemory) == 384 && offsetof(SharedConstants, exportRegions) == 400);
 
 // The factor a fetch multiplies its result by: 2^exponent from fetch constant word 3, and for integer
 // formats (num_format 1) the full range, because the host texture is normalized.
@@ -94,12 +103,17 @@ float TextureExpScale(const xenos::DeviceState& state, uint32_t slot) {
     const bool is_signed = ((word0 >> 2) & 0xFF) == 0x55;
     switch (word1 & 0x3F) {
       case 6: scale *= is_signed ? 127.0f : 255.0f; break;
-      case 25: case 26: scale *= is_signed ? 32767.0f : 65535.0f; break;
+      case 24: case 25: case 26: scale *= is_signed ? 32767.0f : 65535.0f; break;
       default: break;
     }
   }
   return scale;
 }
+
+struct DetilePushConstants {
+  uint64_t source, target;
+  uint32_t source_size, width_blocks, height_blocks, pitch_blocks, block_dwords, block_log2, endian, tiled;
+};
 
 struct ResolvePushConstants {
   uint32_t source_index;
@@ -346,6 +360,15 @@ bool Renderer::Initialize(RenderDevice* device, const uint8_t* physical,
   resolve_vs_ = device_->createShader(k_resolve_vs, sizeof(k_resolve_vs), "VSMain", RenderShaderFormat::SPIRV);
   resolve_ps_ = device_->createShader(k_resolve_ps, sizeof(k_resolve_ps), "PSMain", RenderShaderFormat::SPIRV);
   pack_ps_ = device_->createShader(k_pack_ps, sizeof(k_pack_ps), "PSPack", RenderShaderFormat::SPIRV);
+
+  // Memory export: the compute shader that lays a texture out of the buffer shaders write guest memory into.
+  RenderPipelineLayoutBuilder detileLayout;
+  detileLayout.begin(false, false);
+  detileLayout.addPushConstant(0, 0, sizeof(DetilePushConstants), RenderShaderStageFlag::COMPUTE);
+  detileLayout.end();
+  detile_layout_ = detileLayout.create(device_);
+  detile_cs_ = device_->createShader(k_detile_cs, sizeof(k_detile_cs), "CSMain", RenderShaderFormat::SPIRV);
+  detile_pipeline_ = device_->createComputePipeline(RenderComputePipelineDesc(detile_layout_.get(), detile_cs_.get(), 8, 8, 1));
 
 
   // Index 0 of each heap: 1x1 white textures; sampler 0: linear wrap.
@@ -923,6 +946,160 @@ uint64_t Renderer::TextureContentHash(const xenos::TextureFetch& t, uint32_t byt
   return hash;
 }
 
+Renderer::ExportRegion* Renderer::FindExportRegion(uint32_t address) {
+  address &= 0x1FFFFFFF;
+  for (ExportRegion& region : export_regions_) {
+    if (address >= region.begin && address < region.end) return &region;
+  }
+  return nullptr;
+}
+
+void Renderer::ExportBarrier() {
+  RenderBufferBarrier barrier(export_buffer_.get(), RenderBufferAccess::READ | RenderBufferAccess::WRITE);
+  commands_->barriers(RenderBarrierStage::ALL, &barrier, 1, nullptr, 0);
+}
+
+// Fills the region from guest memory, as the game left it.
+void Renderer::InitializeExportRegion(const ExportRegion& region) {
+  const uint32_t size = region.end - region.begin;
+  // The draws recorded so far may still be writing here.
+  ExportBarrier();
+  const uint8_t* source = physical_ + region.begin;
+  bool empty = true;
+  for (uint32_t i = 0; i + 8 <= size && empty; i += 8) {
+    uint64_t word;
+    std::memcpy(&word, source + i, 8);
+    empty = word == 0;
+  }
+  if (empty) {
+    static_cast<VulkanCommandList*>(commands_)->endActiveRenderPass();
+    vkCmdFillBuffer(static_cast<VulkanCommandList*>(commands_)->vk, static_cast<VulkanBuffer*>(export_buffer_.get())->vk,
+                    region.offset, size, 0);
+  } else {
+    auto staging = device_->createBuffer(RenderBufferDesc::UploadBuffer(size));
+    std::memcpy(staging->map(), source, size);
+    staging->unmap();
+    commands_->copyBufferRegion(export_buffer_->at(region.offset), staging->at(0), size);
+    retired_buffers_.push_back(std::move(staging));
+  }
+  ExportBarrier();
+}
+
+// Makes room for what a draw's memory export writes: pages of guest memory, in the export buffer.
+void Renderer::AddExportRange(uint32_t address, uint32_t size) {
+  const uint32_t begin = address & 0x1FFFF000;
+  const uint32_t end = uint32_t(std::min<uint64_t>(0x20000000, (uint64_t(address & 0x1FFFFFFF) + size + 0xFFF) & ~0xFFFull));
+  if (end <= begin) return;
+  if (!export_buffer_) {
+    // Only for titles that use memory export.
+    export_buffer_ = device_->createBuffer(RenderBufferDesc::DefaultBuffer(
+        kExportBufferSize, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::VERTEX));
+  }
+  ExportRegion* inside = nullptr;
+  ExportRegion merged;
+  merged.begin = begin;
+  merged.end = end;
+  std::vector<ExportRegion> covered;
+  for (ExportRegion& region : export_regions_) {
+    if (region.begin <= begin && end <= region.end) inside = &region;
+    if (region.begin <= end && begin <= region.end) {
+      merged.begin = std::min(merged.begin, region.begin);
+      merged.end = std::max(merged.end, region.end);
+      covered.push_back(region);
+    }
+  }
+  if (inside) return;
+  const uint32_t aligned = (export_used_ + 255) & ~255u;
+  if (uint64_t(aligned) + (merged.end - merged.begin) > kExportBufferSize ||
+      export_regions_.size() - covered.size() >= kMaxExportRegions) {
+    ++stats_["memory export range skipped: no room"];
+    return;
+  }
+  merged.offset = aligned;
+  export_used_ = aligned + (merged.end - merged.begin);
+  merged.generation = ++export_generation_;
+  InitializeExportRegion(merged);
+  // What the smaller regions held goes over the guest memory it was filled with.
+  for (const ExportRegion& old : covered) {
+    commands_->copyBufferRegion(export_buffer_->at(merged.offset + (old.begin - merged.begin)),
+                                export_buffer_->at(old.offset), old.end - old.begin);
+    export_regions_.erase(std::find_if(export_regions_.begin(), export_regions_.end(),
+                                       [&](const ExportRegion& region) { return region.begin == old.begin; }));
+  }
+  if (!covered.empty()) ExportBarrier();
+  export_regions_.push_back(merged);
+  ++stats_["memory export regions"];
+}
+
+// A texture a draw fetches from memory export's region: laid out by a compute shader, in place.
+Renderer::Texture* Renderer::GetExportTexture(const xenos::TextureFetch& t, const ExportRegion& region, Texture& guest,
+                                              bool inserted) {
+  const RenderFormat format = TextureFormat(t);
+  const xenos::TextureBlock block = xenos::GetTextureBlock(t.format);
+  if (t.dimension != 1 || format == RenderFormat::UNKNOWN || block.bytes < 4 || xenos::GetMipLevels(t).size() != 1) {
+    return nullptr;
+  }
+  if (guest.texture && guest.export_generation == region.generation) return &guest;
+  const uint32_t blocksX = (t.width + block.size - 1) / block.size;
+  const uint32_t blocksY = (t.height + block.size - 1) / block.size;
+  const uint64_t linearSize = uint64_t(blocksX) * blocksY * block.bytes;
+  if (!export_scratch_ || export_scratch_size_ < linearSize) {
+    if (export_scratch_) retired_buffers_.push_back(std::move(export_scratch_));
+    export_scratch_size_ = std::max<uint64_t>(linearSize, 16ull << 20);
+    export_scratch_ = device_->createBuffer(
+        RenderBufferDesc::DefaultBuffer(export_scratch_size_, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE));
+  }
+  uint32_t log2 = 0;
+  while ((1u << log2) < block.bytes) ++log2;
+  const uint32_t address = t.address & 0x1FFFFFFF;
+  DetilePushConstants push{};
+  push.source = export_buffer_->getDeviceAddress() + region.offset + (address - region.begin);
+  push.target = export_scratch_->getDeviceAddress();
+  push.source_size = region.end - address;
+  push.width_blocks = blocksX;
+  push.height_blocks = blocksY;
+  push.pitch_blocks = std::max(t.pitch, t.width) / block.size;
+  push.block_dwords = block.bytes / 4;
+  push.block_log2 = log2;
+  push.endian = t.endian;
+  push.tiled = t.tiled;
+  // The export draws wrote the buffer; the copy of the last texture is done with the scratch.
+  RenderBufferBarrier barriers[] = {
+      {export_buffer_.get(), RenderBufferAccess::READ | RenderBufferAccess::WRITE},
+      {export_scratch_.get(), RenderBufferAccess::READ | RenderBufferAccess::WRITE}};
+  commands_->barriers(RenderBarrierStage::ALL, barriers, 2, nullptr, 0);
+  commands_->setComputePipelineLayout(detile_layout_.get());
+  commands_->setPipeline(detile_pipeline_.get());
+  commands_->setComputePushConstants(0, &push);
+  commands_->dispatch((blocksX + 7) / 8, (blocksY + 7) / 8, 1);
+  commands_->barriers(RenderBarrierStage::ALL, &barriers[1], 1, nullptr, 0);
+  if (!guest.texture) {
+    guest.format = format;
+    guest.width = t.width;
+    guest.height = t.height;
+    guest.dimension = t.dimension;
+    guest.texture = device_->createTexture(
+        RenderTextureDesc::Texture(RenderTextureDimension::TEXTURE_2D, t.width, t.height, 1, 1, 1, format, RenderTextureFlag::NONE));
+    RenderTextureViewDesc view;
+    view.format = format;
+    view.dimension = RenderTextureViewDimension::TEXTURE_2D;
+    view.mipLevels = 1;
+    view.componentMapping = SwizzleMapping(t.swizzle);
+    guest.view = guest.texture->createTextureView(view);
+    if (!guest.index) guest.index = AllocateSlot(1);
+    texture_2d_set_->setTexture(guest.index, guest.texture.get(), RenderTextureLayout::SHADER_READ, guest.view.get());
+    ++texture_generation_;
+  }
+  Transition(guest.texture.get(), RenderTextureLayout::COPY_DEST);
+  commands_->copyTextureRegion(
+      RenderTextureCopyLocation::Subresource(guest.texture.get()),
+      RenderTextureCopyLocation::PlacedFootprint(export_scratch_.get(), format, t.width, t.height, 1, blocksX * block.size, 0));
+  Transition(guest.texture.get(), RenderTextureLayout::SHADER_READ);
+  guest.export_generation = region.generation;
+  ++stats_[inserted ? "textures from memory export" : "textures from memory export again"];
+  return &guest;
+}
+
 Renderer::Texture* Renderer::GetGuestTexture(const xenos::TextureFetch& t) {
   const uint32_t fields[] = {t.format, t.endian, t.tiled, t.pitch, t.address, t.mip_address, t.dimension,
                              t.width, t.height, t.depth, t.swizzle, t.is_signed};
@@ -978,6 +1155,9 @@ Renderer::Texture* Renderer::GetGuestTexture(const xenos::TextureFetch& t) {
     return &guest;
   }
   const uint32_t byteSize = xenos::TextureByteSize(t);
+  if (const ExportRegion* region = FindExportRegion(t.address)) {
+    if (Texture* texture = GetExportTexture(t, *region, guest, inserted)) return texture;
+  }
   static const bool verifyTextures = getenv("NATIVE_GPU_VERIFY_TEXTURES") != nullptr;  // debugging
   if (!inserted && !verifyTextures && guest.texture &&
       !(watcher_ && (watcher_->Dirty(t.address & 0x1FFFFFFF, byteSize, guest.watch_stamp) ||
@@ -1646,6 +1826,10 @@ void Renderer::Draw(const DrawCall& call) {
     return;
   }
 
+  for (uint32_t i = 0; i < call.export_count; ++i) AddExportRange(call.exports[i].address, call.exports[i].size);
+  // Memory export draws write the buffer the draws before them wrote and read.
+  if (call.export_count) ExportBarrier();
+
   // Vertex input from the patched vfetch instructions, decoded once for each
   // shader and set of fetches.
   // 16-bit elements per slot (byte offset, dwords): Xenos keeps the first
@@ -2144,6 +2328,13 @@ void Renderer::Draw(const DrawCall& call) {
   shared.loop17 = state.U32(0x33F4);
   shared.posScaleX = 1.0f / xScale;
   shared.posScaleY = 1.0f / scaleXy;
+  if (export_buffer_) shared.exportMemory = export_buffer_->getDeviceAddress();
+  for (uint32_t i = 0; i < export_regions_.size(); ++i) {
+    const ExportRegion& region = export_regions_[i];
+    shared.exportRegions[i][0] = region.begin;
+    shared.exportRegions[i][1] = region.end;
+    shared.exportRegions[i][2] = region.offset;
+  }
   const uint64_t sharedConstants = Allocate(&shared, sizeof(shared));
   const uint64_t pushConstants[] = {upload_address_ + vsConstants, upload_address_ + psConstants,
                                     upload_address_ + sharedConstants};
@@ -2261,6 +2452,14 @@ void Renderer::Draw(const DrawCall& call) {
     commands_->drawInstanced(call.count, 1, call.start, 0);
   }
   ++stats_["draws"];
+  if (call.export_count) {
+    // The draws after this one fetch the textures again.
+    ++texture_generation_;
+    ++export_generation_;
+    for (uint32_t i = 0; i < call.export_count; ++i) {
+      if (ExportRegion* region = FindExportRegion(call.exports[i].address)) region->generation = export_generation_;
+    }
+  }
 }
 
 bool Renderer::ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height,
@@ -2301,6 +2500,28 @@ bool Renderer::ReadResolved(uint32_t address, std::vector<uint8_t>& rgba, uint32
 }
 
 void Renderer::WriteTraceDumps(const std::string& path) {
+  // What memory export wrote: each region as guest memory would hold it.
+  for (const ExportRegion& region : export_regions_) {
+    const uint32_t size = region.end - region.begin;
+    auto readback = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
+    WaitIdle();
+    Frame& frame = frames_[frame_];
+    commands_ = frame.commands.get();
+    commands_->begin();
+    ExportBarrier();
+    commands_->copyBufferRegion(readback->at(0), export_buffer_->at(region.offset), size);
+    commands_->end();
+    const RenderCommandList* lists[] = {commands_};
+    queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
+    queue_->waitForCommandFence(frame.fence.get());
+    char name[64];
+    snprintf(name, sizeof(name), ".export.%08X_%X.raw", region.begin, size);
+    if (FILE* f = fopen((path + name).c_str(), "wb")) {
+      fwrite(readback->map(), 1, size, f);
+      readback->unmap();
+      fclose(f);
+    }
+  }
   for (TraceDump& dump : trace_dumps_) {
     char name[64];
     snprintf(name, sizeof(name), ".%03u.%08X_%ux%u_%u.raw", dump.index, dump.address, dump.width, dump.height, dump.format);

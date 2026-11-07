@@ -9,8 +9,9 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, 51 FPS and 19.2 ms a frame on the renderer thread on RADV (Renoir). Base colours, normals, ambient and
-  point lights work; the sun still adds little (shadow mask, below), so the picture is dark next to the emulated one.
+* First track: reached, 51 FPS and 19 ms a frame on the renderer thread on RADV (Renoir). The lit buffer matches the emulated one
+  in ratio 1 to 1.5 where the terrain is not involved (HDR mean 0.13 against 0.21); the final picture is still 4 to 5 times
+  too dark (exposure, below) and the terrain lacks its pages.
 * Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
   95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
@@ -92,13 +93,19 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   4. The `cube` instruction was translated as `cube(r)` of its first register, unswizzled. The hardware takes the direction
      v as v.zzxy and v.yxzz in its two operands; the translation now takes the second operand's `.yxz`.
   The picture is now lit (albedo, normals, ambient, lights), HDR mean 0.08 to 0.11 with max 2.5 where emulated is 0.13.
-* Still wrong, the sun: the mask (40768DE1) now has no black, but its red channel, the shadow term, is 1 everywhere where the
-  emulated one is 0 in shadow (same moment: `scratchpad/z34`, the bike, the railings, the wall). The PS writes
-  r = fade + the variance shadow term from slot 2 (the k_16_16 atlas, signed, so SNORM here), g, b, a = fade + slot 3 (the
-  1_5_5_5 atlas) .xyz; the lighting pass reads the mask's x and y. The native blue channel has exactly the shapes the
-  emulated red has, so the geometry (volumes, stencil, 4x/1x) is right and it is the term from the 16_16 atlas that says lit:
-  its fetch (sign 1, exp 0.999969, 512x2048) and coordinates are the next thing to check, or the atlas bands the caster
-  pass fills (band 0 holds casters, bands 1 to 3 hold the clear word and zero).
+* The sun's shadow mask (40768DE1) and the g-buffer normals, fixed (2026-11-07, same moment in both runs, `nav.py` with
+  `NAV_TRACES=60`; at 30 s the two modes are at different points of the intro camera):
+  1. The mask resolves to a `k_8_8` texture (copy info 0x501), taking the shader's x and y. Resolves of 8888 targets come out
+     blue first (mode 3, `value.bgra`, undone by the fetch's swizzle); that also went for the 8 and 8_8 destinations, so the
+     lighting pass read the shader's z (always 1) as the shadow term. The atlas, its moments (SNORM, exp adjust -15, the
+     0.5 * m + 0.5 in the shader), the light space coordinates from the depth and the constants were right all along; the
+     k_16_16 band contents match the emulated dump in shape. Resolves to `k_8` and `k_8_8` now keep the component order.
+  2. The g-buffer is two targets: RT0 8888 (albedo, resolved to 15537000) and RT1 2_10_10_10 (normals, resolved with
+     RB_COPY_CONTROL source 1 to 152D7000). Draws only claim the first target's EDRAM tiles, so the resolve of RT1 found
+     its tiles owned by another surface and cleared them to the clear word: the normal buffer read all zero (biased: (-1,-1,-1)),
+     the lighting pass had no sun and ambient/point lights without shape. `ResolveCall::second_target` skips that check.
+     (Claiming RT1's tiles in the draw path instead breaks the loading screen: its top half goes black.) The HDR mean went
+     from 0.04 to 0.13.
 * Tools: the emulated front buffer was decoded as A, R, G, B (the red tint); the dwords hold R, G, B, A in memory order, as the
   resolve swaps red and blue. `<dump>.trace` (both modes) traces the next frame; in observe mode the traced frame also writes
   its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
@@ -106,10 +113,21 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
 
 Next, in order:
 
-1. The sun: the shadow term from the 16_16 atlas (above).
+1. Exposure: the final picture is 4 to 5 times darker than the emulated one although the lit buffer is about right. The
+   tonemap (PS BD6D432E414F4E49) scales by `c8.y / c8.x` of its pixel constants, from the CPU: 0.117 / 0.55 natively,
+   0.0585 / 0.1447 emulated (the other values of the draw, c0 to c2 and c252 to c255, are equal). The CPU reads the history
+   texture the exposure pass (PS 577E03101947F4E9, 16x1 `k_16_FLOAT` ring updated at the pixel `c0.w`, input the 1x1
+   log luminance from the pyramid) writes to guest memory. Natively that texture holds 0, 1, 2 ... 15 in the traced frame
+   (the emulated one 0.189 in 8 entries and luminance samples in the others, `TRACE guest` at its destination), and the
+   pass writes the same ramp back: the pixel for `c0.w` takes the path that keeps the old value. By hand, with a ramp
+   history the update is skipped unless the new value falls outside the history, so what to look at is where the ramp
+   comes from (initial guest memory, or an earlier pass of ours) and whether the predicate counter `r15.w` chain of the
+   translation is right (not checked against the hardware's predicate stack). The log luminance pyramid is of the right
+   kind (last level -0.9 to -2.8 natively, -0.1 to -3.7 emulated, scenes of different brightness).
 2. Page loading: native keeps requesting one page a frame where the emulated run stops after about 2,500; the atlases hold
-   3 % of their blocks 70 s into the track (emulated not measured).
-3. Frame rate: 51 FPS on the track, 19.2 ms a frame on the renderer thread (RADV, Renoir), aim 60.
+   3 % of their blocks 70 s into the track (emulated not measured). The floor and the sign boards stay dark and untextured.
+3. Frame rate: 51 FPS on the track, 19 ms a frame on the renderer thread (RADV, Renoir), aim 60. The EDRAM stale-tile clear
+   ran 155,000 times in one 110 s run ("EDRAM: color target overwritten by another surface").
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

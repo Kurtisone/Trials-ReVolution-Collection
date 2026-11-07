@@ -1710,8 +1710,9 @@ void Renderer::Resolve(const ResolveCall& call) {
   const bool depth = call.flags & 4;
   Texture& source = depth ? GetDepthSurface(call.state) : GetColorSurface(call.state);
   // A colour resolve in another format than the one that wrote the tiles (the 16_16 shadow pass read as
-  // 8_8_8_8 right after its clearing resolve) reads what the tiles hold: the clear word.
-  if (!depth) {
+  // 8_8_8_8 right after its clearing resolve) reads what the tiles hold: the clear word. The second target's
+  // tiles are not tracked (draws only claim the first's), and the g-buffer's normals sit there.
+  if (!depth && !call.second_target) {
     Texture& depthSurface = GetDepthSurface(call.state);
     SetTargets(source.texture.get(), nullptr);
     TrackEdram(call.state, source, depthSurface, true, false,
@@ -1763,6 +1764,9 @@ void Renderer::Resolve(const ResolveCall& call) {
     if (((copyInfo >> 7) & 0x3F) == 3 && ((copyInfo >> 16) & 0x3F) == 8) {
       push.mode = 5;
       format = RenderFormat::R16G16B16A16_FLOAT;
+    } else if (const uint32_t destFormat = (copyInfo >> 7) & 0x3F; destFormat == xenos::kTex_8 || destFormat == xenos::kTex_8_8) {
+      // One or two components keep the shader's order: only four-component 8888 comes out blue first.
+      push.mode = 0;
     } else {
       push.mode = 3;
     }

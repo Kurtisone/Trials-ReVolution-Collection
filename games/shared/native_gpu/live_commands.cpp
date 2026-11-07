@@ -768,6 +768,7 @@ bool OnCopy(const rex::graphics::NativeCommandEvent& event) {
     call.has_rect = true;
     std::copy(rect, rect + 4, call.rect);
     call.source_scale = scale;
+    call.second_target = !depth && source;
     call.trace_index = g_trace_index ? g_trace_index++ : 0;
     if (call.trace_index) g_recording.dump = true;
     DeferredCall deferred{DeferredCall::Kind::kResolve, state, {}, {}, call};

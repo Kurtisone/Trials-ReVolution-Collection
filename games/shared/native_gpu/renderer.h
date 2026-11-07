@@ -89,6 +89,7 @@ struct ResolveCall {
   float clear_depth = 1.0f;  // ClearZ (f1), for flags 0x200
   // A 4x guest surface drawn at 1x: source pixels per destination pixel.
   int32_t source_scale = 1;
+  bool second_target = false;  // the source is the pass's second colour target (RB_COLOR1_INFO)
   uint32_t trace_index = 0;  // debugging: nonzero keeps a copy of the result
 };
 

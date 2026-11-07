@@ -249,7 +249,8 @@ class Renderer {
   Texture& CreateSurface(uint64_t key, uint32_t width, uint32_t height, plume::RenderFormat format,
                          bool depth);
   void Transition(plume::RenderTexture* texture, plume::RenderTextureLayout layout);
-  void CopyResolveToTable(Texture& source, uint32_t address, uint32_t width, uint32_t height);
+  void CopyResolveToTable(Texture& source, uint32_t address, uint32_t source_x, uint32_t source_y, uint32_t width,
+                          uint32_t height);
   void SetTargets(plume::RenderTexture* color, plume::RenderTexture* depth,
                   plume::RenderTexture* color1 = nullptr);
   void SetMainLayout();

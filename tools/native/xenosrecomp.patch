@@ -269,7 +269,7 @@
  uint g_SpecConstants();
  
  #endif
-@@ -67,6 +79,177 @@
+@@ -67,6 +79,179 @@
      return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
  }
  
@@ -425,8 +425,10 @@
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 +    uint width, height, levels;
 +    texture.GetDimensions(0, width, height, levels);
-+    // A level past the last one reads the last, as the fetch constant's maximum level clamps it.
-+    texture.GetDimensions(min(uint(max(lod, 0.0)), levels - 1), width, height, levels);
++    // A level past the last one reads zero (the page table's seed frames fetch level 8 of 8 to start a level over).
++    if (uint(max(lod, 0.0)) >= levels)
++        return 0.0;
++    texture.GetDimensions(uint(max(lod, 0.0)), width, height, levels);
 +    float2 dimensions = float2(width, height);
 +    float2 uv = denormalized ? (texCoord + offset) / dimensions : texCoord + offset / dimensions;
 +    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], uv, lod);
@@ -447,7 +449,7 @@
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-@@ -161,6 +344,11 @@
+@@ -161,6 +346,11 @@
      return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
  }
  

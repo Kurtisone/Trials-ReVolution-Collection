@@ -506,6 +506,10 @@ void Renderer::WaitFrame(Frame& frame) {
           std::memcpy(texel, &value, 2);
         } else {
           std::memcpy(texel, host, std::min(bytes, entry.host_bytes));
+          // 8_8_8_8 resolves come out blue first (undone by the fetch's swizzle); memory holds red first unless the copy swaps.
+          if (entry.target.format == xenos::kTex_8_8_8_8 && entry.host_bytes == 4 && !entry.target.swap_red_blue) {
+            std::swap(texel[0], texel[2]);
+          }
         }
         xenos::SwapEndian(texel, bytes, entry.target.endian);
         std::memcpy(guest + xenos::TiledOffset2D(int32_t(entry.target.x + x), int32_t(entry.target.y + y), pitch, log2),
@@ -1635,8 +1639,10 @@ void Renderer::RefreshVolume(Texture& dest) {
 }
 
 // A resolve into the virtual texture table: finds the level and block its address means and
-// copies there, on the GPU and in command order.
-void Renderer::CopyResolveToTable(Texture& source, uint32_t address, uint32_t width, uint32_t height) {
+// copies there, on the GPU and in command order. The block sits at (source_x, source_y) of the
+// resolve's texture: a resolve just below an earlier one at the same pitch joins its texture.
+void Renderer::CopyResolveToTable(Texture& source, uint32_t address, uint32_t source_x, uint32_t source_y, uint32_t width,
+                                  uint32_t height) {
   int32_t found = -1;
   uint32_t best = 0;
   for (uint32_t level = 0; level < table_levels_.size(); ++level) {
@@ -1688,7 +1694,7 @@ void Renderer::CopyResolveToTable(Texture& source, uint32_t address, uint32_t wi
   }
   Transition(source.texture.get(), RenderTextureLayout::COPY_SOURCE);
   Transition(table_texture_, RenderTextureLayout::COPY_DEST);
-  const RenderBox box(0, 0, int32_t(width), int32_t(height));
+  const RenderBox box(int32_t(source_x), int32_t(source_y), int32_t(source_x + width), int32_t(source_y + height));
   commands_->copyTextureRegion(RenderTextureCopyLocation::Subresource(table_texture_, uint32_t(found), 0),
                                RenderTextureCopyLocation::Subresource(source.texture.get(), 0, 0), x, y, 0, &box);
   Transition(table_texture_, RenderTextureLayout::SHADER_READ);
@@ -1719,6 +1725,7 @@ void Renderer::Resolve(const ResolveCall& call) {
                call.has_rect ? uint32_t(std::max(call.rect[3], 0)) : ViewportBottom(call.state), true, std::nullopt, std::nullopt, true);
   }
   uint32_t address = call.state.Reg(0x2319) & 0xFFFFF000;  // RB_COPY_DEST_BASE
+  const uint32_t guestAddress = address;
   const uint32_t destPitch = call.state.Reg(0x231A) & 0x3FFF;      // RB_COPY_DEST_PITCH
   const uint32_t destHeight = (call.state.Reg(0x231A) >> 16) & 0x3FFF;
   int32_t rect[4] = {0, 0, int32_t(destPitch), int32_t(destHeight)};
@@ -1884,7 +1891,8 @@ void Renderer::Resolve(const ResolveCall& call) {
         if (t.valid && t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address) GetGuestTexture(t);
       }
       if (table_texture_) {
-        CopyResolveToTable(dest, address, uint32_t(rect[2] - rect[0]), uint32_t(rect[3] - rect[1]));
+        CopyResolveToTable(dest, guestAddress, uint32_t(x), uint32_t(destY), uint32_t(rect[2] - rect[0]),
+                           uint32_t(rect[3] - rect[1]));
       } else {
         ++stats_["table: resolve before the table exists"];
       }
@@ -2676,6 +2684,39 @@ void Renderer::WriteTraceDumps(const std::string& path) {
       fwrite(readback->map(), 1, size, f);
       readback->unmap();
       fclose(f);
+    }
+  }
+  // The virtual texture table as it stands after the traced frame, level by level (RGBA16F raw values).
+  if (table_texture_ && !trace_dumps_.empty()) {
+    for (uint32_t level = 0; level < table_levels_.size(); ++level) {
+      const xenos::MipLevel& m = table_levels_[level];
+      const uint64_t size = uint64_t(m.width) * m.height * 8;
+      auto readback = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
+      WaitIdle();
+      Frame& frame = frames_[frame_];
+      commands_ = frame.commands.get();
+      commands_->begin();
+      layouts_[table_texture_] = RenderTextureLayout::SHADER_READ;
+      Transition(table_texture_, RenderTextureLayout::COPY_SOURCE);
+      VkBufferImageCopy region{};
+      region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      region.imageSubresource.mipLevel = level;
+      region.imageSubresource.layerCount = 1;
+      region.imageExtent = {m.width, m.height, 1};
+      vkCmdCopyImageToBuffer(static_cast<VulkanCommandList*>(commands_)->vk, static_cast<VulkanTexture*>(table_texture_)->vk,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VulkanBuffer*>(readback.get())->vk, 1, &region);
+      Transition(table_texture_, RenderTextureLayout::SHADER_READ);
+      commands_->end();
+      const RenderCommandList* lists[] = {commands_};
+      queue_->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
+      queue_->waitForCommandFence(frame.fence.get());
+      char name[64];
+      snprintf(name, sizeof(name), ".table.%u_%ux%u.raw", level, m.width, m.height);
+      if (FILE* f = fopen((path + name).c_str(), "wb")) {
+        fwrite(readback->map(), 1, size, f);
+        readback->unmap();
+        fclose(f);
+      }
     }
   }
   for (TraceDump& dump : trace_dumps_) {

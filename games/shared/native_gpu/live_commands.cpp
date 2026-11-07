@@ -923,27 +923,47 @@ void DumpGuestFrontBuffer(uint32_t address) {
   }
 }
 
+// The virtual texture table (2048x2048 1_5_5_5 with 8 levels, the CPU's view of it): found among the fetch constants.
+uint32_t g_table_mips = 0, g_table_base = 0;
+
+void FindTable(const uint32_t* registers) {
+  for (uint32_t i = 0; i < 16 && !g_table_mips; ++i) {
+    const uint32_t* t = registers + kRegFetchConstants + 6 * i;
+    if ((t[0] & 3) == 2 && (t[1] & 0x3F) == 3 && (t[2] & 0x1FFF) == 2047 && t[5]) {
+      g_table_mips = t[5] & 0xFFFFF000;
+      g_table_base = t[1] & 0xFFFFF000;
+    }
+  }
+}
+
+// Guest memory's table as the CPU reads it: its mips, then its base.
+void DumpGuestTable(const std::string& path) {
+  if (!g_table_mips) return;
+  const size_t bytes = size_t(g_table_base - g_table_mips) + 2048 * 2048 * 2;
+  if (FILE* f = std::fopen((path + ".table.bin").c_str(), "wb")) {
+    std::fwrite(g_memory->TranslatePhysical(g_table_mips), 1, bytes, f);
+    std::fclose(f);
+  }
+}
+
 bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   using Kind = rex::graphics::NativeCommandEvent::Kind;
+  if (event.kind != Kind::kSwap) FindTable(event.registers);
   // The emulated GPU renders; the trace only looks, for a reference to compare with.
   if (REXCVAR_GET(native_gpu_observe)) {
-    static uint32_t heavy = 0, draws = 0, table = 0, frame = 0, last_count = 0;
+    static uint32_t heavy = 0, draws = 0, frame = 0, last_count = 0;
     static std::map<std::string, uint32_t> recent;
     if (event.kind != Kind::kSwap) {
       const uint32_t* r = event.registers;
-      for (uint32_t i = 0; i < 16 && !table; ++i) {
-        const uint32_t* t = r + kRegFetchConstants + 6 * i;
-        if ((t[0] & 3) == 2 && (t[1] & 0x3F) == 3 && (t[2] & 0x1FFF) == 2047 && t[5]) table = t[5] & 0xFFFFF000;
-      }
       recent[fmt::format("{} vs={:016X} ps={:016X} m={:X}", event.kind == Kind::kCopy ? "COPY" : "DRAW", event.vs_hash, event.ps_hash,
                          event.kind == Kind::kCopy ? r[0x2319] >> 16 : r[0x2104])]++;
     } else {
-      if (table && ++frame % 10 == 0) {
-        const uint8_t* q = g_memory->TranslatePhysical(table);
+      if (g_table_mips && ++frame % 10 == 0) {
+        const uint8_t* q = g_memory->TranslatePhysical(g_table_mips);
         uint32_t n = 0;
         for (uint32_t k = 0; k + 4 <= (3u << 20); k += 4) n += (q[k] | q[k + 1] | q[k + 2] | q[k + 3]) != 0;
         if (n != last_count && (last_count == 0 || frame < 40)) {
-          REXLOG_INFO("TABLE frame {} mips {:08X} nonzero {} -> {}", frame, table, last_count, n);
+          REXLOG_INFO("TABLE frame {} mips {:08X} nonzero {} -> {}", frame, g_table_mips, last_count, n);
           for (const auto& [what, count] : recent) REXLOG_INFO("TABLE   {} x{}", what, count);
         }
         last_count = n;
@@ -963,6 +983,7 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
       if (std::filesystem::remove(path + ".trigger", error) || tracing) {
         DumpGuestFrontBuffer(event.front_buffer & 0x1FFFFFFF);
       }
+      if (tracing) DumpGuestTable(path);
       for (size_t i = 0; i < resolves.size(); ++i) {
         const Resolve& resolve = resolves[i];
         const xenos::TextureBlock block = xenos::GetTextureBlock(resolve.format);
@@ -995,6 +1016,7 @@ bool OnCommand(const rex::graphics::NativeCommandEvent& event, void*) {
   static bool tracing = false;
   if (event.kind == Kind::kDraw) ++draws_this_frame;
   if (event.kind == Kind::kSwap) {
+    if (tracing) DumpGuestTable(REXCVAR_GET(native_gpu_dump_path));
     std::error_code error;
     tracing = (REXCVAR_GET(native_gpu_trace_frame) == -1 && draws_this_frame > 800 && traced++ == 240) ||
               std::filesystem::remove(REXCVAR_GET(native_gpu_dump_path) + ".trace", error);

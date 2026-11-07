@@ -9,8 +9,8 @@ Works in part, Turnip T30 only, off by default (`native_gpu_render = true`). Qua
 `VK_ERROR_UNKNOWN` although all the SPIR-V validates.
 
 * Title screen, menus and interface: right, title at 122 FPS on the Odin 2 Portal.
-* First track: reached, 51 FPS and 19 ms a frame on the renderer thread on RADV (Renoir). The final picture is now about as
-  bright as the emulated one (mean 120 against 146 in luminance, same moment); the floor and the signboards still lack their pages.
+* First track: reached, 45 FPS and 22 ms a frame on the renderer thread on RADV (Renoir). The final picture is about as bright as
+  the emulated one and the floor and signboards have their pages (the page table and the pages the game asks for now match the emulated run).
 * Virtual texture table: **works**. Seed = point list PS 0D26ADDF22CBC739 (not the memory export shaders), then 6398EA and
   95BB84 build each level from the one above. The table lives on the host (`CopyResolveToTable`) as RGBA16F: its fetch is
   integer, the shaders scale by 1/255, so it holds raw values. Blocks resolved at its base address must not replace it.
@@ -43,8 +43,9 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   1_5_5_5 words, and truncated 11 to 10; now the same words as the emulated run's for the common entries (42,000 of 1,048,576 differ, as pages move).
 * `getCompTexLOD` wrote its result to x whatever the destination swizzle; the feedback shaders read it in y.
 * Page draws (BCFF66D9 / 758C4BE0; the renderer counts "memory export draws"), over a whole run on Greenhorn's Grove: emulated 52 at
-  the start, then about 2,500 in the 2,000 frames after the track begins, and none after; native now 3,800 after 80 s on the
-  track, about one a frame throughout (it was 64 in all before). The feedback decides, and its coverage was the rectangle of
+  the start, then about 2,500 in the 2,000 frames after the track begins, and none after; native 1,410 at the end of a run,
+  all in the first 1,100 frames of the track, none after (it was 64 in all before; the stat also counts the one 4 MB export
+  draw each frame at 14E9A000, which is not a page draw, so the 4,000 it reached were no pages). The feedback decides, and its coverage was the rectangle of
   the top left 120x64 texels (30 %) where the emulated one has requests in 99 %; native is now 100 % (`fb.py`). Cause: the
   clears of the pass are rect lists in window coordinates (PA_CL_VTE_CNTL 0x300), two to a pass, the second on the 4x
   surface (RB_SURFACE_INFO msaa 2) that covers what the first leaves: (240..256, all rows) and (0..120, 0..64) in 4x samples,
@@ -119,32 +120,27 @@ Established since (2026-11-07, Linux/RADV, Greenhorn's Grove):
   its front buffer and what each resolve left in guest memory (`<dump>.<n>.<address>_<w>x<h>_guest<format>.bin`, tiled,
   numbered like the native dumps), so a same-moment pair is one `nav.py` run each with `NAV_TRACES`.
 
+* Page table and page requests, fixed (2026-11-08; per level the table now holds the same number of entries as the emulated one in the
+  traced frame at 60 s, 688,128 / 172,032 / 43,008 / 10,752 / 2,688 / 672 / 168 / 42 for levels 0 to 7, on the host and in guest memory):
+  1. The cascade's first frame draws 6398EA at level 8 over the 8-level table (c0.x = 8, w 0.5) to start level 7 over. A fetch of a
+     level past the last returns zero (the emulated run leaves only the seeds there); the clamp to the last level added earlier
+     enlarged level 7 into itself, whose 2x blocks then spread through every level (levels 3 and below ended up completely
+     filled, the guest table too). `tfetch2DLod` now returns zero.
+  2. `CopyResolveToTable` copied each resolve from (0, 0) of the resolve's texture to the address's block, but the second pair of
+     blocks of a level (e.g. 1ED50000 below 1ED40000, pitch 512 rows 448) joins the first one's texture as a band: the first
+     block was copied twice and the lower quadrants never. It now takes the address the game wrote and the band's own offset.
+  3. The feedback resolve (8_8_8_8, 256x128, copy info 0x302: no swap bit) was read back to guest memory blue first; memory
+     holds red first unless the copy's swap bit is set (as for 1_5_5_5), so the CPU saw the page flag where it expects the
+     page coordinate and requested nothing (64 page draws in a run). Now 1,400 page draws and the floor and signs are textured.
+* Tools: `tbl.py` (levels, three columns: emulated, native host, native guest) and `tblcmp.py` (entry by entry) read `<dump>.table.bin` (guest
+  memory, written by both modes for the traced frame) and `<dump>.table.<level>_WxH.raw` (the native host table, written at
+  the end of the traced frame).
+
 Next, in order:
 
-1. Page table cascade: native keeps requesting about one page a frame (4,600 after 80 s) where the emulated run stops
-   after about 2,500, and the floor and signboards stay untextured. What is known (2026-11-07, `tat.sh`, `tbl.py`,
-   `tblmask.py`; guest memory addresses as in the traced frame):
-   * The page table (2048 wide, 1_5_5_5, 8 levels, `mip_max_level` 7) is not written by the CPU or by memory export. The
-     only seeds are PS 0D26ADDF point lists (12 to 26 points of one pixel, in the first frames; later 1 or 2 points every
-     ~14 s). Everything else is the cascade, each frame: 6398EA (copy of level c0.x, or with c0.w = 0.5 a block of the finer
-     level as the 2x enlargement of level c0.x at texel (c0.yz + pixel) / 2, `texLod` = c0.x) and 95BB84 (normalized coordinates,
-     level c0.x - c254.x, a quadrant of the viewport as the quad is half the clip space: a window of a finer level, scrolled by
-     the integer part of c0.yz * c254.y, over the copy). The emulated table fills to about 1,000,000 nonzero entries in 10
-     frames and then changes little (a count of the table's 11 MB in guest memory every 250 swaps); every 64x64, 128x128
-     and 256x256 block of levels 2 to 0 resolved in the steady frames is nonzero, natively they are zero from level 3 on
-     (dumps 5 and up of the traced frame), while the guest copy the CPU reads holds only 131,000 + 130,000 entries
-     (emulated 1,015,000). The CPU reads that guest table to decide which pages to load, so it asks again for what it believes
-     is missing.
-   * Fixed on the way: a fetch with `setTexLOD` past the last level (the seed frames draw 6398EA with c0.x = 8 over level 7)
-     asked `GetDimensions` for a level that does not exist, so the whole copy came out as zero; `tfetch2DLod` now clamps the
-     level to the last. With it the first cascade frame has the same entry counts per level as the emulated one (28, 112, 448,
-     1,792, 7,168), but 60 s into the track levels 7 to 4 hold more than the emulated ones (64, 256, 3,840, 15,360 against 42,
-     168, 672, 2,688) and level 3 and below are still empty; before the clamp levels 7 and 6 matched and 5 and 4 held 62 %.
-     So something else still differs in the steady frames: the quadrant draws (95BB84) of levels 5 to 3, which read windows
-     of levels 2 to 0, or the copy of a resolved block into the table (`CopyResolveToTable`). Not found. A point list's size
-     is not the cause: `PA_SU_POINT_SIZE` is 1 pixel there, as the emulated mask shows.
-2. Frame rate: 51 FPS on the track, 19 ms a frame on the renderer thread (RADV, Renoir), aim 60. The EDRAM stale-tile clear
-   ran 155,000 times in one 110 s run ("EDRAM: color target overwritten by another surface").
+1. Frame rate: 45 FPS on the track, 22 ms a frame on the renderer thread (RADV, Renoir; 51 and 19 before the floor was textured),
+   aim 60. The EDRAM stale-tile clear ran 155,000 times in one 110 s run ("EDRAM: color target overwritten by another surface").
+2. The emulated front buffer in `side.py` pairs shows a green and yellow tint, so colours are not compared yet.
 
 How it fits: `games/shared/native_gpu` holds Skate's renderer and `live_commands.cpp`. SDK patch 0008 hands every draw, resolve
 and swap to it with the register file; `SnapshotState` lays the registers out as the device snapshot the renderer reads, so

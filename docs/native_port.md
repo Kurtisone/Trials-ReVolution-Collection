@@ -310,6 +310,53 @@ its state from the command stream, where the SDK already has every register, con
 
 The virtual texture table (2048 x 2048, 8 MB) is reloaded whole 4 to 5 times a frame, about 73 MB, most of TexUpload.
 
+## Where the time goes on Linux
+
+Native renderer on the first track (Greenhorn's Grove at the start line), Radeon Renoir (RADV), Release build, no frame
+limit, 1,850 draws and 56 resolves a frame. The renderer thread was the limit, not the GPU: it never waited for the fence
+(`GPU wait` 0.0 in the 300 frame line), and the game's render thread waits for it. Measured with `perf` (user space only:
+`--user-callchains` is the one call graph this kernel's `perf_event_paranoid=2` lets through) and with `rdtsc` timers in the
+renderer, because this machine's clock source is HPET and `steady_clock` costs 1.2 us a call. In the logs,
+`native_gpu_stats_seconds` gives the renderer thread's rate, and the 300 frame line the GPU's own time (timestamp queries),
+`calls` (recording draws, clears and resolves) and `read back` (the CPU's conversion of small resolves).
+
+| ms a frame, renderer thread | Before | After |
+| --- | --- | --- |
+| Draws (1,850) | 9.4 | 6.5 |
+| Read back of small resolves into guest memory (800,000 texels, 41 rects) | 9.8 | 3.3 |
+| Resolves (56) | 2.6 | 1.0 |
+| Present copy of the front buffer (CPU readback, 2.5 MB) | 0.4 | 0.8 |
+| Everything else | 2.6 | 1.6 |
+| Renderer thread, timed | 24.8 | 13.2 |
+| Renderer thread, as logged (no timers) | 21.6 | 12.0 to 13.5 |
+| GPU, frame start to end | 8 to 10 | 8 to 10 |
+
+Of the draws, constants cost 3.5 ms before and 1.5 now, textures 1.4 and 0.4, pipeline lookup 1.2 and 0.7, vertex and index
+buffers 1.2, recording commands 1.5, the rest under 1.
+
+Where it went:
+
+1. The read back converted every texel of 41 rects a frame, most of them the virtual texture page table, 71 % of them the same
+   as in the frame before. The conversion is one loop per format now, with a table for the page table's half floats (9.8 to
+   5.2 ms), and rows that are the same as last time are left alone (to 3.2 ms), unless nothing is known of the memory:
+   a write by the game since (`WriteWatcher`), or a rect written before this one over the same tiles (rects overlap: the
+   page table's levels are resolved into one another's memory, and the last one in order has to win). In a run with every
+   skipped row checked, none was wrong after the first seconds. The buffers are kept, not created and freed for each rect.
+2. Two scratch addresses were resolved at five sizes and formats in turn (the post processing chain, the table's smallest
+   levels), and a texture was created for each every frame, 0.25 ms apiece. Each size keeps its texture now (1.9 ms).
+3. Draws uploaded 8 KB of constants each, byte swapped twice. Only the registers a shader's ALU instructions read are
+   uploaded (`ConstantCount`, checked by filling the rest of the upload buffer with NaN: same picture), the game's thread
+   works out what changed since the draw before, and the snapshot keeps the constants in the host's order.
+4. A draw built its pipeline description and hashed it; it is found from the registers the pipeline is made of now.
+   Textures are bound once for draws with the same fetch constants. Counting draws no longer looks up a string.
+
+With `native_gpu_frame_limit = 60` the first track holds 60.0 FPS, the renderer thread at 10 to 11.5 ms (worst frame 13.4 ms),
+and 66 to 80 FPS without it.
+
+What stays: the read back (3 ms: the compare and the scatter into the tiled layout, which only the GPU packing the table to
+2 bytes a texel would cut), recording the draws (RADV's share is about 2 ms), the present copy (a GPU side present through
+the swapchain would save it), the GPU at 9 ms. Xvfb has no DRI3, so what presenting costs on a real display is not shown here.
+
 ## Verdict so far
 
 60 FPS on the Odin 2 Portal is out of reach by removing emulation alone. With the 44 ms split as above, a renderer with no

@@ -36,6 +36,12 @@ struct DrawCall {
   xenos::DeviceState state;
   uint64_t vs_key = 0;
   uint64_t ps_key = 0;
+  // Float constants (from c0) each shader reads: only these are uploaded.
+  uint32_t vs_constants = 256, ps_constants = 256;
+  // What changed since the draw recorded before this one: the float constants (from c0, as [begin, end)) and the
+  // fetch constants of the 16 texture slots.
+  uint32_t vs_dirty_begin = 0, vs_dirty_end = 256, ps_dirty_begin = 0, ps_dirty_end = 256;
+  bool fetch_changed = true;
   uint32_t primitive = 0;  // Xenos primitive type
   // PA_SC_WINDOW_SCISSOR_TL / BR (the surface's size when never set), in the draw's own samples.
   uint32_t scissor_tl = 0, scissor_br = 0;
@@ -163,10 +169,15 @@ class Renderer {
                     uint32_t& height, uint32_t* format_out = nullptr);
 
   // Why draws or textures were skipped, and counts, for reports.
-  const std::map<std::string, uint32_t>& stats() const { return stats_; }
+  std::map<std::string, uint32_t> stats() const {
+    std::map<std::string, uint32_t> all = stats_;
+    all["draws"] = draws_;
+    all["draws with polygon offset"] = polygon_offset_draws_;
+    return all;
+  }
   // Where the renderer thread's time goes, for the pacing log.
   struct Timings {
-    double gpu_wait_ms = 0.0, texture_ms = 0.0, buffer_ms = 0.0, submit_ms = 0.0, worst_texture_frame_ms = 0.0,
+    double gpu_wait_ms = 0.0, gpu_ms = 0.0, read_back_ms = 0.0, texture_ms = 0.0, buffer_ms = 0.0, submit_ms = 0.0, worst_texture_frame_ms = 0.0,
            worst_buffer_frame_ms = 0.0, worst_submit_ms = 0.0, texture_watch_ms = 0.0, texture_create_ms = 0.0;
     uint32_t textures = 0, buffers = 0, textures_unchanged = 0, textures_deferred = 0;
   };
@@ -218,6 +229,7 @@ class Renderer {
   // Releases a resolved texture once the recording frame has completed.
   void RetireResolved(Texture& texture);
   void RetireResolvedSlots(Texture& texture);
+  void RetireSpares(uint32_t address);
   void RetireVolume(Texture& texture);
   void RefreshVolume(Texture& texture);
 
@@ -293,6 +305,22 @@ class Renderer {
     bool swap_red_blue = false;
   };
   std::vector<ReadBackTarget> read_back_;
+  // What each read back rect held last time (host texels), and when guest memory last took it.
+  struct ReadBackRecord {
+    std::vector<uint8_t> texels;
+    uint32_t watch_stamp = 0;
+    // The guest memory the rect's tiles are in, from the first byte to one past the last of each tile row.
+    std::vector<std::pair<uint32_t, uint32_t>> spans;
+    // For each of the tile rows: one written after this rect's last entry wrote over it (its rows go again),
+    // and one this entry wrote (what a rect written after it has to write over).
+    std::vector<uint8_t> overwritten, written;
+    // Where the last of this rect's entries comes in the frame being read back, if there is one.
+    uint64_t pass = 0;
+    size_t last_position = 0;
+  };
+  uint64_t read_back_pass_ = 0;
+  std::unordered_map<uint64_t, ReadBackRecord> read_back_records_;
+  std::multimap<uint64_t, std::unique_ptr<plume::RenderBuffer>> read_back_buffers_;  // done with, by size
   plume::RenderTexture* table_texture_ = nullptr;
   std::vector<xenos::MipLevel> table_levels_;
   struct TraceDump {
@@ -309,6 +337,9 @@ class Renderer {
     std::vector<ReadBack> read_backs;
     std::unique_ptr<plume::RenderCommandList> commands;
     std::unique_ptr<plume::RenderCommandFence> fence;
+    // Timestamps at the frame's start and end, for the stats line.
+    void* queries = nullptr;  // VkQueryPool
+    bool timed = false;
     std::unique_ptr<plume::RenderBuffer> upload;  // per-frame uploads
     bool pending = false;
     // Released once the frame has completed.
@@ -357,11 +388,14 @@ class Renderer {
 
   std::unordered_map<uint64_t, Shader> shaders_;
   std::unordered_map<uint64_t, std::unique_ptr<plume::RenderPipeline>> pipelines_;
+  std::unordered_map<uint64_t, plume::RenderPipeline*> pipeline_inputs_;  // by what a draw builds its pipeline from
   std::unordered_map<uint64_t, Texture> guest_textures_;
   std::unordered_map<uint64_t, uint32_t> sampler_indices_;
   std::vector<std::unique_ptr<plume::RenderSampler>> samplers_;
   std::unordered_map<uint64_t, Texture> surfaces_;   // EDRAM render targets
   std::unordered_map<uint32_t, Texture> resolved_;   // by destination address
+  // Resolved textures of another width than the current one at their address, by address, width and format.
+  std::map<uint64_t, Texture> resolved_spares_;
   std::map<std::pair<plume::RenderTexture*, plume::RenderTexture*>,
            std::unique_ptr<plume::RenderFramebuffer>> framebuffers_;
   std::unordered_map<plume::RenderTexture*, plume::RenderTextureLayout> layouts_;
@@ -382,6 +416,7 @@ class Renderer {
   std::vector<std::optional<uint32_t>> edram_depth_clears_ = std::vector<std::optional<uint32_t>>(2048);
   bool main_layout_bound_ = false;
   std::map<std::string, uint32_t> stats_;
+  uint32_t draws_ = 0, polygon_offset_draws_ = 0;  // counted apart: bumped for each draw
   uint64_t TextureContentHash(const xenos::TextureFetch& t, uint32_t byte_size) const;
   std::vector<uint8_t> convert_buffer_;
   float requested_wide_ = 1.0f, render_wide_ = 1.0f;
@@ -413,7 +448,8 @@ class Renderer {
   struct ConstantUpload {
     const void* upload = nullptr;
     uint64_t offset = 0;
-    std::array<uint8_t, 4096> source{};
+    uint32_t bytes = 0;
+    uint32_t dirty_begin = 0, dirty_end = 0;  // changed since this upload, in float4s
   };
   ConstantUpload vs_constants_, ps_constants_;
   struct EdramUse {
@@ -427,8 +463,19 @@ class Renderer {
     uint32_t generation = 0;
     uint8_t fetch[24] = {};
     uint32_t texture_2d = 0, texture_3d = 0, texture_cube = 0, sampler = 0;
+    float exp_scale = 1.0f;
+    uint32_t bias = 0;
   };
   std::array<SlotBinding, 1024> bindings_;
+  // What the last draw bound, for the next if it has the same fetch constants.
+  struct TextureBindings {
+    uint32_t generation = 0;
+    uint32_t indices[4][16] = {};  // 2D, 3D, cube textures, samplers
+    float exp_scale[16] = {};
+    uint32_t bias[2] = {};
+  };
+  TextureBindings last_textures_;
+  bool fetch_dirty_ = true;  // fetch constants changed since last_textures_ was taken
   uint32_t texture_generation_ = 1;
   const void* bound_pipeline_ = nullptr;
   float bound_viewport_[12] = {}, bound_bias_[2] = {};

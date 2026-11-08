@@ -24,6 +24,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -285,6 +286,8 @@ struct Frame {
   std::vector<uint32_t> dump_addresses;
 };
 Frame g_recording;
+// The snapshot of the last draw recorded in this frame, for the next to compare with.
+size_t g_previous_draw = SIZE_MAX;
 void RenderDeferredCalls(Frame& frame) {
   for (DeferredCall& call : frame.calls) {
     const xenos::DeviceState state{frame.arena.data() + call.state};
@@ -373,13 +376,16 @@ void WaitEarlyPresent() {
 
 void RenderFrame(Frame& frame) {
   const auto start = std::chrono::steady_clock::now();
+  static double calls_ms = 0.0;  // recording the frame's draws, clears and resolves
   static uint32_t rendered_frames = 0;
   const bool chatty = ++rendered_frames <= 6;
   if (chatty) REXLOG_INFO("native_gpu: frame {} begins, {} calls", rendered_frames, frame.calls.size());
   uint32_t gamma_ramp[256];
   if (g_get_gamma_ramp && g_get_gamma_ramp(gamma_ramp)) g_renderer->SetGammaRamp(gamma_ramp);
   g_renderer->BeginFrame();
+  const auto calls_start = std::chrono::steady_clock::now();
   RenderDeferredCalls(frame);
+  calls_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - calls_start).count();
   if (chatty) REXLOG_INFO("native_gpu: frame {} recorded", rendered_frames);
   // The last frame's pixels go with this EndFrame.
   WaitEarlyPresent();
@@ -443,15 +449,15 @@ void RenderFrame(Frame& frame) {
   if (++frames == 300) {
     g_renderer->SavePipelineCache();
     const native_gpu::Renderer::Timings t = g_renderer->TakeTimings();
-    REXLOG_INFO("native_gpu: renderer, ms/frame: GPU wait {:.1f}, textures {:.1f} ({} uploaded, {} unchanged, {} deferred, worst frame {:.1f}, watch {:.0f} ms, create {:.0f} ms), "
+    REXLOG_INFO("native_gpu: renderer, ms/frame: GPU {:.1f}, GPU wait {:.1f}, calls {:.1f}, read back {:.1f}, textures {:.1f} ({} uploaded, {} unchanged, {} deferred, worst frame {:.1f}, watch {:.0f} ms, create {:.0f} ms), "
                 "buffers {:.1f} (worst frame {:.1f}), submit {:.1f} (worst {:.1f}), present copy {:.1f}; "
                 "worst frame {:.1f}",
-                t.gpu_wait_ms / frames, t.texture_ms / frames, t.textures, t.textures_unchanged, t.textures_deferred, t.worst_texture_frame_ms,
+                t.gpu_ms / frames, t.gpu_wait_ms / frames, calls_ms / frames, t.read_back_ms / frames, t.texture_ms / frames, t.textures, t.textures_unchanged, t.textures_deferred, t.worst_texture_frame_ms,
                 t.texture_watch_ms, t.texture_create_ms,
                 t.buffer_ms / frames, t.worst_buffer_frame_ms, t.submit_ms / frames, t.worst_submit_ms,
                 copy_ms / frames, worst_ms);
     frames = 0;
-    worst_ms = copy_ms = 0.0;
+    worst_ms = copy_ms = calls_ms = 0.0;
   }
 }
 
@@ -548,10 +554,9 @@ size_t SnapshotState(const uint32_t* regs) {
   for (uint32_t i = 0; i < 192; ++i) {
     StoreBE32(state + xenos::device::kFetchConstants + 4 * i, regs[kRegFetchConstants + i]);
   }
-  for (uint32_t i = 0; i < 256 * 4; ++i) {
-    StoreBE32(state + xenos::device::kVertexConstants + 4 * i, regs[kRegFloatConstants + i]);
-    StoreBE32(state + xenos::device::kPixelConstants + 4 * i, regs[kRegFloatConstants + 256 * 4 + i]);
-  }
+  // The float constants stay in the host's order: the renderer uploads them as they are.
+  std::memcpy(state + xenos::device::kVertexConstants, regs + kRegFloatConstants, 256 * 16);
+  std::memcpy(state + xenos::device::kPixelConstants, regs + kRegFloatConstants + 256 * 4, 256 * 16);
   for (uint32_t i = 0; i < 4; ++i) {
     StoreBE32(state + xenos::device::kVertexBoolConstants + 4 * i, regs[kRegBoolConstants + i]);
     StoreBE32(state + xenos::device::kPixelBoolConstants + 4 * i, regs[kRegBoolConstants + 4 + i]);
@@ -572,6 +577,7 @@ size_t SnapshotState(const uint32_t* regs) {
 struct KnownShader {
   uint64_t key = 0;  // 0: not in the shader cache
   bool memexport = false;
+  uint32_t constants = 256;  // float constants (from c0) its ALU instructions read
   std::vector<uint32_t> streams;  // float constants the shader's memory export streams come from
   std::vector<uint8_t> big_endian;
 };
@@ -617,6 +623,34 @@ std::vector<uint32_t> MemoryExportStreams(const uint32_t* ucode, uint32_t dwords
   return streams;
 }
 
+// How many float constants, from c0, the ALU instructions of the exec clauses read; all 256 when one of them
+// addresses constants relative to a register. A constant operand takes the register field of its source.
+uint32_t ConstantCount(const uint32_t* ucode, uint32_t dwords) {
+  uint32_t used = 0;
+  uint32_t limit = dwords / 3 * 2;
+  for (uint32_t i = 0; i < limit; ++i) {
+    const uint32_t* triple = ucode + i / 2 * 3;
+    const uint32_t word0 = i % 2 ? triple[1] >> 16 | triple[2] << 16 : triple[0];
+    const uint32_t word1 = i % 2 ? triple[2] >> 16 : triple[1] & 0xFFFF;
+    const uint32_t opcode = word1 >> 12;
+    if (opcode >= 1 && opcode <= 7) limit = std::min(limit, (word0 & 0x1FF) * 2);
+    if ((opcode < 1 || opcode > 6) && opcode != 13 && opcode != 14) continue;
+    const uint32_t address = word0 & 0xFFF, count = (word0 >> 12) & 7, sequence = (word0 >> 16) & 0xFFF;
+    for (uint32_t j = 0; j < count; ++j) {
+      if ((sequence >> (2 * j)) & 1 || (address + j) * 3 + 2 >= dwords) continue;  // a fetch
+      const uint32_t* alu = ucode + (address + j) * 3;
+      bool reads = false;
+      for (uint32_t source = 0; source < 3; ++source) {  // src3, src2, src1
+        if ((alu[2] >> (29 + source)) & 1) continue;  // a register
+        reads = true;
+        used = std::max(used, ((alu[2] >> (8 * source)) & 0xFF) + 1);
+      }
+      if (reads && (alu[1] >> 30)) return 256;  // const_0_rel_abs, const_1_rel_abs
+    }
+  }
+  return used;
+}
+
 std::unordered_map<uint64_t, KnownShader> g_shaders;
 std::mutex g_container_mutex;
 std::unordered_map<uint64_t, const uint8_t*> g_containers;
@@ -627,6 +661,7 @@ const KnownShader& FindShader(uint64_t hash, const uint32_t* ucode, uint32_t dwo
     KnownShader& shader = it->second;
     shader.big_endian.resize(dwords * 4);
     for (uint32_t i = 0; i < dwords; ++i) StoreBE32(&shader.big_endian[i * 4], ucode[i]);
+    shader.constants = ConstantCount(ucode, dwords);
     shader.memexport = WritesMemory(ucode, dwords);
     if (shader.memexport) shader.streams = MemoryExportStreams(ucode, dwords);
     const uint64_t key = XXH3_64bits(shader.big_endian.data(), shader.big_endian.size());
@@ -659,6 +694,7 @@ void SyncRenderer() {
   if (!g_recording.resolves) return;
   Frame frame = std::move(g_recording);
   g_recording = Frame{};
+  g_previous_draw = SIZE_MAX;
   frame.sync = true;
   std::unique_lock<std::mutex> lock(g_queue_mutex);
   g_queue_cv.wait(lock, [] { return !g_queued.has_value(); });
@@ -691,6 +727,14 @@ void AddExportRanges(const KnownShader& shader, const uint32_t* constants, nativ
   }
 }
 
+// The first and one past the last float4 of 256 that differ between two snapshots' constants.
+std::pair<uint32_t, uint32_t> ChangedConstants(const uint8_t* before, const uint8_t* now) {
+  uint32_t first = 0, last = 256;
+  while (first < last && !std::memcmp(before + first * 16, now + first * 16, 16)) ++first;
+  while (last > first && !std::memcmp(before + (last - 1) * 16, now + (last - 1) * 16, 16)) --last;
+  return {first, last};
+}
+
 uint32_t g_trace_index = 0;
 bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   if (!event.vs_ucode) return true;
@@ -705,7 +749,11 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
   if (!vertex.key || (pixel && !pixel->key)) return false;
   native_gpu::DrawCall call;
   call.vs_key = vertex.key;
-  if (pixel) call.ps_key = pixel->key;
+  call.vs_constants = vertex.constants;
+  if (pixel) {
+    call.ps_key = pixel->key;
+    call.ps_constants = pixel->constants;
+  }
   call.vs_physical = vertex.big_endian.data();
   call.vs_physical_size = uint32_t(vertex.big_endian.size());
   call.primitive = event.primitive;
@@ -727,6 +775,17 @@ bool OnDraw(const rex::graphics::NativeCommandEvent& event) {
     call.indices_endian = event.index_endian;
   }
   const size_t draw_state = SnapshotState(event.registers);
+  // What the previous draw of this frame left as it was: the renderer uploads and rebinds only what changed.
+  if (g_previous_draw != SIZE_MAX) {
+    const uint8_t* now = g_recording.arena.data() + draw_state;
+    const uint8_t* before = g_recording.arena.data() + g_previous_draw;
+    std::tie(call.vs_dirty_begin, call.vs_dirty_end) =
+        ChangedConstants(before + xenos::device::kVertexConstants, now + xenos::device::kVertexConstants);
+    std::tie(call.ps_dirty_begin, call.ps_dirty_end) =
+        ChangedConstants(before + xenos::device::kPixelConstants, now + xenos::device::kPixelConstants);
+    call.fetch_changed = std::memcmp(before + xenos::device::kFetchConstants, now + xenos::device::kFetchConstants, 16 * 24) != 0;
+  }
+  g_previous_draw = draw_state;
   DeferredCall deferred{DeferredCall::Kind::kDraw, draw_state, call, {}, {}};
   g_recording.calls.push_back(deferred);
   return true;
@@ -834,6 +893,7 @@ void OnSwap(const rex::graphics::NativeCommandEvent& event) {
   }
   g_queue_cv.notify_all();
   g_recording = Frame{};
+  g_previous_draw = SIZE_MAX;
   g_recording.calls.reserve(recorded_calls + recorded_calls / 4);
   g_recording.arena.reserve(recorded_bytes + recorded_bytes / 4);
 }

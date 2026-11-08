@@ -335,6 +335,77 @@ RenderBlendOperation BlendOp(uint32_t op) {
   }
 }
 
+
+// A texel's bytes in the order the guest's endian mode stores them.
+template <uint32_t Bytes>
+inline void SwapTexel(uint8_t* texel, uint32_t bytes, uint32_t endian) {
+  if constexpr (Bytes == 2) {
+    if (endian == 1) std::swap(texel[0], texel[1]);
+  } else if constexpr (Bytes == 4) {
+    uint32_t v;
+    std::memcpy(&v, texel, 4);
+    if (endian == 1) v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+    else if (endian == 2) v = __builtin_bswap32(v);
+    else if (endian == 3) v = (v << 16) | (v >> 16);
+    std::memcpy(texel, &v, 4);
+  } else if constexpr (Bytes != 1) {
+    xenos::SwapEndian(texel, bytes, endian);
+  }
+}
+
+// What a read back resolve writes into guest memory: its texels converted one by one (`texel_of` fills
+// the guest texel from the host's and returns false for one to leave alone), swapped to the guest's byte
+// order and put where the tiled layout has them. Bytes is the guest texel size, 0 when only known at run time.
+struct ScatterRect {
+  uint32_t x, y, width, height, host_bytes, bytes, endian, pitch, log2;
+  // The host texels this rect held last time, updated as rows are converted. With `compare`, rows that
+  // are the same are left alone (the guest memory still holds what they gave), unless their tile row is
+  // marked in `overwritten`. The tile rows converted are marked in `written`.
+  uint8_t* previous;
+  bool compare;
+  const uint8_t* overwritten;
+  uint8_t* written;
+};
+template <uint32_t Bytes, typename Convert>
+bool ScatterTexels(uint8_t* guest, const uint8_t* data, const ScatterRect& rect, Convert&& texel_of) {
+  const uint32_t bytes = Bytes ? Bytes : rect.bytes;
+  const size_t rowBytes = size_t(rect.width) * rect.host_bytes;
+  bool converted = false;
+  for (uint32_t y = 0; y < rect.height; ++y) {
+    const uint8_t* row = data + size_t(y) * rowBytes;
+    if (rect.previous) {
+      const uint32_t tile_row = ((rect.y + y) >> 5) - (rect.y >> 5);
+      uint8_t* last = rect.previous + size_t(y) * rowBytes;
+      if (rect.compare && !rect.overwritten[tile_row] && !std::memcmp(last, row, rowBytes)) continue;
+      std::memcpy(last, row, rowBytes);
+      rect.written[tile_row] = 1;
+    }
+    converted = true;
+    for (uint32_t x = 0; x < rect.width; ++x) {
+      uint8_t texel[8];
+      if (!texel_of(row + size_t(x) * rect.host_bytes, texel)) continue;
+      SwapTexel<Bytes>(texel, bytes, rect.endian);
+      uint8_t* at = guest + xenos::TiledOffset2D(int32_t(rect.x + x), int32_t(rect.y + y), rect.pitch, rect.log2);
+      if constexpr (Bytes != 0) std::memcpy(at, texel, Bytes);
+      else std::memcpy(at, texel, bytes);
+    }
+  }
+  return converted;
+}
+
+// The integer a page table half float holds, rounded (the host holds 11 as 10.99), by the half's bits.
+const uint8_t* PageTableChannels() {
+  static const std::array<uint8_t, 65536> table = [] {
+    std::array<uint8_t, 65536> t{};
+    for (uint32_t h = 0; h < 65536; ++h) {
+      const uint32_t exponent = (h >> 10) & 31;
+      t[h] = uint8_t(exponent ? uint32_t(((uint64_t(1024 | (h & 1023)) << exponent) + (1u << 24)) >> 25) : 0u);
+    }
+    return t;
+  }();
+  return table.data();
+}
+
 void CopySwapped32(uint8_t* dst, const uint8_t* src, size_t bytes) {
   for (size_t i = 0; i < bytes; i += 4) {
     const uint32_t value = xenos::LoadBE32(src + i);
@@ -369,6 +440,13 @@ bool Renderer::Initialize(RenderDevice* device, const uint8_t* physical,
   for (Frame& frame : frames_) {
     frame.commands = queue_->createCommandList();
     frame.fence = device_->createCommandFence();
+    VkQueryPoolCreateInfo queries{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queries.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(static_cast<VulkanDevice*>(device_)->vk, &queries, nullptr, &pool) == VK_SUCCESS) {
+      frame.queries = pool;
+    }
     frame.upload = device_->createBuffer(RenderBufferDesc::UploadBuffer(
         kUploadSize, RenderBufferFlag::CONSTANT | RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
   }
@@ -471,7 +549,44 @@ void Renderer::WaitFrame(Frame& frame) {
   timings_.gpu_wait_ms +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
   frame.pending = false;
-  for (Frame::ReadBack& entry : frame.read_backs) {
+  if (frame.timed) {
+    frame.timed = false;
+    uint64_t stamps[2];
+    if (vkGetQueryPoolResults(static_cast<VulkanDevice*>(device_)->vk, VkQueryPool(frame.queries), 0, 2, sizeof(stamps), stamps,
+                              sizeof(uint64_t[1]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+      timings_.gpu_ms += double(stamps[1] - stamps[0]) *
+                         double(static_cast<VulkanDevice*>(device_)->physicalDeviceProperties.limits.timestampPeriod) * 1e-6;
+    }
+  }
+  const auto read_back_start = std::chrono::steady_clock::now();
+  // Frames repeat most of what they resolve: rows the host holds as last time stay as they were in guest
+  // memory, as long as nothing wrote there since (the pages of the rect's tile rows are watched). Each rect
+  // keeps its last texels in a record, found here, with the place of its last entry in this frame.
+  std::vector<ReadBackRecord*> records;
+  if (watcher_) {
+    ++read_back_pass_;
+    for (size_t position = 0; position < frame.read_backs.size(); ++position) {
+      const Frame::ReadBack& entry = frame.read_backs[position];
+      const uint64_t key = XXH3_64bits_withSeed(&entry.target, sizeof(entry.target), entry.address) ^
+                           (uint64_t(entry.width) << 40) ^ (uint64_t(entry.height) << 52);
+      ReadBackRecord& record = read_back_records_[key];
+      record.pass = read_back_pass_;
+      record.last_position = position;
+      if (record.spans.empty()) {
+        const uint32_t tile = 32 * 32 * entry.target.bytes;
+        const uint32_t pitch = std::max(entry.target.pitch, entry.target.x + entry.width), tiles = (pitch + 31) / 32;
+        for (uint32_t row = entry.target.y >> 5; row <= (entry.target.y + entry.height - 1) >> 5; ++row) {
+          record.spans.emplace_back(entry.address + (row * tiles + (entry.target.x >> 5)) * tile,
+                                    entry.address + (row * tiles + ((entry.target.x + entry.width - 1) >> 5) + 1) * tile);
+        }
+      }
+      record.overwritten.resize(record.spans.size());
+      record.written.resize(record.spans.size());
+      records.push_back(&record);
+    }
+  }
+  for (size_t position = 0; position < frame.read_backs.size(); ++position) {
+    Frame::ReadBack& entry = frame.read_backs[position];
     // Into guest memory as a resolve lays it out: tiled, in the guest's byte order.
     const uint8_t* data = static_cast<const uint8_t*>(entry.buffer->map());
     const uint32_t bytes = entry.target.bytes;
@@ -479,49 +594,95 @@ void Renderer::WaitFrame(Frame& frame) {
     while ((1u << log2) < bytes) ++log2;
     auto* guest = const_cast<uint8_t*>(physical_) + entry.address;
     const uint32_t pitch = std::max(entry.target.pitch, entry.target.x + entry.width);
-    uint8_t texel[8];
-    for (uint32_t y = 0; y < entry.height; ++y) {
-      for (uint32_t x = 0; x < entry.width; ++x) {
-        const uint8_t* host = data + (size_t(y) * entry.width + x) * entry.host_bytes;
-        if (entry.target.format == 2 && entry.host_bytes == 4) {
-          texel[0] = host[entry.target.swap_red_blue ? 0 : 2];
-        } else if (entry.target.format == 3 && entry.host_bytes == 8) {
-          // The page table: half floats holding the source bytes as integers, written as 1_5_5_5.
-          const auto channel = [&](uint32_t c) {
-            const uint16_t h = uint16_t(host[2 * c] | host[2 * c + 1] << 8);
-            const uint32_t exponent = (h >> 10) & 31;
-            // Rounded: the host holds 11 as 10.99.
-            return exponent ? uint32_t(((uint64_t(1024 | (h & 1023)) << exponent) + (1u << 24)) >> 25) : 0u;
-          };
-          const uint32_t red = channel(entry.target.swap_red_blue ? 0 : 2), blue = channel(entry.target.swap_red_blue ? 2 : 0);
-          const uint16_t value = uint16_t((channel(3) & 1) << 15 | (red & 31) << 10 | (channel(1) & 31) << 5 | (blue & 31));
-          if (!value) continue;
-          std::memcpy(texel, &value, 2);
-        } else if (entry.target.format == 3 && entry.host_bytes == 4) {
-          // 8_8_8_8 in memory order (blue first) to 1_5_5_5.
-          const uint32_t red = host[entry.target.swap_red_blue ? 0 : 2], blue = host[entry.target.swap_red_blue ? 2 : 0];
-          const uint16_t value = uint16_t((host[3] >> 7) << 15 | (red >> 3) << 10 | (host[1] >> 3) << 5 | (blue >> 3));
-          // Frames render late: an empty entry here may predate what memory export wrote since.
-          if (!value) continue;
-          std::memcpy(texel, &value, 2);
-        } else {
-          std::memcpy(texel, host, std::min(bytes, entry.host_bytes));
-          // 8_8_8_8 resolves come out blue first (undone by the fetch's swizzle); memory holds red first unless the copy swaps.
-          if (entry.target.format == xenos::kTex_8_8_8_8 && entry.host_bytes == 4 && !entry.target.swap_red_blue) {
-            std::swap(texel[0], texel[2]);
-          }
-        }
-        xenos::SwapEndian(texel, bytes, entry.target.endian);
-        std::memcpy(guest + xenos::TiledOffset2D(int32_t(entry.target.x + x), int32_t(entry.target.y + y), pitch, log2),
-                    texel, bytes);
+    const uint32_t hostBytes = entry.host_bytes;
+    const bool swapRB = entry.target.swap_red_blue;
+    ReadBackRecord* record = watcher_ ? records[position] : nullptr;
+    bool compare = false;
+    uint32_t recordAddress = 0, recordSize = 0;
+    if (record) {
+      const uint32_t band = ((pitch + 31) & ~31u) * 32 * bytes;
+      recordAddress = entry.address + (entry.target.y >> 5) * band;
+      recordSize = (((entry.target.y + entry.height - 1) >> 5) + 1) * band - (entry.target.y >> 5) * band;
+      const size_t size = size_t(entry.width) * entry.height * hostBytes;
+      compare = record->texels.size() == size && !watcher_->Dirty(recordAddress, recordSize, record->watch_stamp);
+      if (record->texels.size() != size) record->texels.resize(size);
+    }
+    uint8_t none = 0;
+    if (record) std::fill(record->written.begin(), record->written.end(), uint8_t(0));
+    const ScatterRect rect{entry.target.x, entry.target.y, entry.width, entry.height, hostBytes, bytes,
+                           entry.target.endian, pitch, log2, record ? record->texels.data() : nullptr, compare,
+                           record ? record->overwritten.data() : &none, record ? record->written.data() : &none};
+    bool converted = false;
+    if (entry.target.format == 2 && hostBytes == 4 && bytes == 1) {
+      converted = ScatterTexels<1>(guest, data, rect, [&](const uint8_t* host, uint8_t* texel) {
+        texel[0] = host[swapRB ? 0 : 2];
+        return true;
+      });
+    } else if (entry.target.format == 3 && hostBytes == 8 && bytes == 2) {
+      // The page table: half floats holding the source bytes as integers, written as 1_5_5_5.
+      const uint8_t* channels = PageTableChannels();
+      converted = ScatterTexels<2>(guest, data, rect, [&](const uint8_t* host, uint8_t* texel) {
+        uint16_t h[4];
+        std::memcpy(h, host, 8);
+        const uint32_t red = channels[h[swapRB ? 0 : 2]], blue = channels[h[swapRB ? 2 : 0]];
+        const uint16_t value = uint16_t((channels[h[3]] & 1) << 15 | (red & 31) << 10 | (channels[h[1]] & 31) << 5 | (blue & 31));
+        std::memcpy(texel, &value, 2);
+        return value != 0;
+      });
+    } else if (entry.target.format == 3 && hostBytes == 4 && bytes == 2) {
+      // 8_8_8_8 in memory order (blue first) to 1_5_5_5.
+      converted = ScatterTexels<2>(guest, data, rect, [&](const uint8_t* host, uint8_t* texel) {
+        const uint32_t red = host[swapRB ? 0 : 2], blue = host[swapRB ? 2 : 0];
+        const uint16_t value = uint16_t((host[3] >> 7) << 15 | (red >> 3) << 10 | (host[1] >> 3) << 5 | (blue >> 3));
+        // Frames render late: an empty entry here may predate what memory export wrote since.
+        std::memcpy(texel, &value, 2);
+        return value != 0;
+      });
+    } else {
+      // 8_8_8_8 resolves come out blue first (undone by the fetch's swizzle); memory holds red first unless the copy swaps.
+      const bool swapRed = entry.target.format == xenos::kTex_8_8_8_8 && hostBytes == 4 && !swapRB;
+      const auto copy = [&](const uint8_t* host, uint8_t* texel) {
+        std::memcpy(texel, host, std::min(bytes, hostBytes));
+        if (swapRed) std::swap(texel[0], texel[2]);
+        return true;
+      };
+      switch (bytes) {
+        case 1: converted = ScatterTexels<1>(guest, data, rect, copy); break;
+        case 2: converted = ScatterTexels<2>(guest, data, rect, copy); break;
+        case 4: converted = ScatterTexels<4>(guest, data, rect, copy); break;
+        case 8: converted = ScatterTexels<8>(guest, data, rect, copy); break;
+        default: converted = ScatterTexels<0>(guest, data, rect, copy); break;
       }
     }
     entry.buffer->unmap();
+    if (read_back_buffers_.size() < 128) {
+      read_back_buffers_.emplace(uint64_t(entry.width) * entry.height * entry.host_bytes, std::move(entry.buffer));
+    }
+    if (record && (converted || !compare)) {
+      record->watch_stamp = watcher_->Watch(recordAddress, recordSize);
+      // What this wrote may be where the texels of a rect written after it are: that one goes again over
+      // those tile rows, as it did before rows were left alone. (One written before it was overwritten, as
+      // it was then.)
+      for (auto& [other_key, other] : read_back_records_) {
+        if (&other == record || other.pass != read_back_pass_ || other.last_position <= position) continue;
+        for (size_t a = 0, b = 0; a < record->spans.size() && b < other.spans.size();) {
+          if (record->written[a] && record->spans[a].first < other.spans[b].second &&
+              other.spans[b].first < record->spans[a].second) {
+            other.overwritten[b] = 1;
+          }
+          (record->spans[a].second < other.spans[b].second ? a : b)++;
+        }
+      }
+    }
+    // Written over, and this rect went again over it: nothing is left to redo.
+    if (record) std::fill(record->overwritten.begin(), record->overwritten.end(), uint8_t(0));
     auto it = resolved_.find(entry.address);
     if (watcher_ && it != resolved_.end()) {
       it->second.watch_stamp = watcher_->Watch(entry.address, uint32_t(size_t(entry.target.y + entry.height) * pitch * bytes));
     }
   }
+  timings_.read_back_ms +=
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - read_back_start).count();
   frame.read_backs.clear();
   frame.retired_framebuffers.clear();
   frame.retired_buffers.clear();
@@ -624,11 +785,18 @@ void Renderer::BeginFrame() {
     last_color_ = last_depth_ = nullptr;
   }
   last_edram_use_ = {};
+  vs_constants_ = ps_constants_ = {};  // pointed into the last frame's snapshot
   Frame& frame = frames_[frame_];
   WaitFrame(frame);
   commands_ = frame.commands.get();
   UseUploadBuffer(frame.upload.get(), kUploadSize);
   commands_->begin();
+  if (frame.queries) {
+    VkCommandBuffer vk = static_cast<VulkanCommandList*>(commands_)->vk;
+    vkCmdResetQueryPool(vk, VkQueryPool(frame.queries), 0, 2);
+    vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VkQueryPool(frame.queries), 0);
+    frame.timed = true;
+  }
   current_targets_ = {};
   current_color1_ = nullptr;
   main_layout_bound_ = false;
@@ -737,8 +905,14 @@ void Renderer::EndFrame(uint32_t present_address) {
     entry.height = target.height;
     entry.host_bytes = RenderFormatSize(texture.format);
     entry.target = target;
-    entry.buffer = device_->createBuffer(
-        RenderBufferDesc::ReadbackBuffer(uint64_t(entry.width) * entry.height * entry.host_bytes));
+    const uint64_t bytes = uint64_t(entry.width) * entry.height * entry.host_bytes;
+    // The same rects come back every frame: their buffers are kept, not created again.
+    if (const auto spare = read_back_buffers_.find(bytes); spare != read_back_buffers_.end()) {
+      entry.buffer = std::move(spare->second);
+      read_back_buffers_.erase(spare);
+    } else {
+      entry.buffer = device_->createBuffer(RenderBufferDesc::ReadbackBuffer(bytes));
+    }
     Transition(texture.texture.get(), RenderTextureLayout::COPY_SOURCE);
     VkBufferImageCopy region{};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -753,6 +927,10 @@ void Renderer::EndFrame(uint32_t present_address) {
     frame.read_backs.push_back(std::move(entry));
   }
   read_back_.clear();
+  if (frame.timed) {
+    vkCmdWriteTimestamp(static_cast<VulkanCommandList*>(commands_)->vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        VkQueryPool(frame.queries), 1);
+  }
   commands_->end();
   const RenderCommandList* lists[] = {commands_};
   const auto submit_start = std::chrono::steady_clock::now();
@@ -1593,6 +1771,14 @@ void Renderer::RetireResolved(Texture& dest) {
 }
 
 // The texture heap slots of a retired resolve texture, free once the frame that may sample it is done.
+void Renderer::RetireSpares(uint32_t address) {
+  for (auto it = resolved_spares_.lower_bound(uint64_t(address) << 32);
+       it != resolved_spares_.end() && (it->first >> 32) == address; it = resolved_spares_.erase(it)) {
+    RetireResolved(it->second);
+    RetireResolvedSlots(it->second);
+  }
+}
+
 void Renderer::RetireResolvedSlots(Texture& dest) {
   if (dest.index) retired_slots_.emplace_back(1, dest.index);
   dest.index = 0;
@@ -1807,6 +1993,31 @@ void Renderer::Resolve(const ResolveCall& call) {
   dest.texel_bytes = ResolveBytes((call.state.Reg(0x231B) >> 7) & 0x3F);
   if (!dest.texture || dest.format != format || dest.width != hostWidth || dest.height < hostHeight) {
     ++texture_generation_;
+    // Scratch addresses are resolved at several sizes and formats in turn (the post processing chain, the
+    // page table's smallest levels): each keeps its texture, put aside while another is current.
+    const auto spareKey = [&](uint32_t width, RenderFormat spareFormat) {
+      return uint64_t(address) << 32 | uint64_t(width) << 8 | uint64_t(spareFormat);
+    };
+    if (dest.texture && resolved_spares_.size() < 64) {
+      auto old = resolved_spares_.find(spareKey(dest.width, dest.format));
+      if (old != resolved_spares_.end()) {
+        RetireResolved(old->second);
+        RetireResolvedSlots(old->second);
+        resolved_spares_.erase(old);
+      }
+      resolved_spares_[spareKey(dest.width, dest.format)] = std::move(dest);
+      dest = Texture{};
+      dest.texel_bytes = ResolveBytes((call.state.Reg(0x231B) >> 7) & 0x3F);
+    }
+    if (const auto spare = resolved_spares_.find(spareKey(hostWidth, format));
+        !dest.texture && spare != resolved_spares_.end() && spare->second.height >= hostHeight) {
+      dest = std::move(spare->second);
+      dest.texel_bytes = ResolveBytes((call.state.Reg(0x231B) >> 7) & 0x3F);
+      dest.watch_stamp = 0;
+      resolved_spares_.erase(spare);
+    }
+  }
+  if (!dest.texture || dest.format != format || dest.width != hostWidth || dest.height < hostHeight) {
     if (dest.texture) {
       // The draws recorded so far still sample the old texture through its slots: the new one gets its own.
       RetireResolved(dest);
@@ -1933,6 +2144,20 @@ void Renderer::Resolve(const ResolveCall& call) {
 
 void Renderer::Draw(const DrawCall& call) {
   const xenos::DeviceState& state = call.state;
+  // Kept up with every draw, also those skipped below: what changed since the last upload or binding.
+  const auto addDirty = [](ConstantUpload& last, uint32_t begin, uint32_t end) {
+    if (begin >= end) return;
+    if (last.dirty_begin >= last.dirty_end) {
+      last.dirty_begin = begin;
+      last.dirty_end = end;
+    } else {
+      last.dirty_begin = std::min(last.dirty_begin, begin);
+      last.dirty_end = std::max(last.dirty_end, end);
+    }
+  };
+  addDirty(vs_constants_, call.vs_dirty_begin, call.vs_dirty_end);
+  addDirty(ps_constants_, call.ps_dirty_begin, call.ps_dirty_end);
+  fetch_dirty_ |= call.fetch_changed;
   RenderPrimitiveTopology topology;
   bool quads = false, rects = false;
   switch (call.primitive) {
@@ -2255,62 +2480,93 @@ void Renderer::Draw(const DrawCall& call) {
 
   // Textures (resolved ones by address first) and samplers.
   SharedConstants shared;
-  for (uint32_t slot = 0; slot < 16; ++slot) {
-    // A fetch constant already seen, with no texture changed since.
-    const uint8_t* fetchConstant = state.data + xenos::device::kFetchConstants + 24 * slot;
-    shared.texExpScale[slot] = TextureExpScale(state, slot);
-    shared.texBias[slot >> 3] |= TextureBiasBits(state, slot) << ((slot & 7) * 4);
-    uint32_t words[3];
-    std::memcpy(words, fetchConstant, 12);
-    SlotBinding& binding = bindings_[((words[0] * 2654435761u) ^ (words[1] * 40503u) ^ words[2]) >> 22];
-    if (binding.generation == texture_generation_ && !std::memcmp(binding.fetch, fetchConstant, 24)) {
-      shared.texture2DIndices[slot] = binding.texture_2d;
-      shared.texture3DIndices[slot] = binding.texture_3d;
-      shared.textureCubeIndices[slot] = binding.texture_cube;
-      shared.samplerIndices[slot] = binding.sampler;
-      continue;
-    }
-    const xenos::TextureFetch t = xenos::DecodeTextureFetch(state, slot);
-    if (!t.valid) continue;
-    // A block resolved at the table's base address is part of the table, not a texture.
-    const bool table = t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address;
-    auto resolved = table ? resolved_.end() : resolved_.find(t.address);
-    if (resolved != resolved_.end() && watcher_ &&
-        watcher_->Dirty(t.address & 0x1FFFFFFF, resolved->second.resolved_size,
-                        resolved->second.watch_stamp)) {
-      // Written by the game since it was resolved: the guest texture now.
-      RetireResolved(resolved->second);
-      RetireResolvedSlots(resolved->second);
-      resolved_.erase(resolved);
-      resolved = resolved_.end();
-      ++texture_generation_;
-      ++stats_["resolved textures overwritten by the game"];
-    }
-    if (resolved != resolved_.end()) {
-      shared.texture2DIndices[slot] = ResolvedIndex(resolved->second, t.swizzle);
-      // A stack of 2D layers (size field bits 26+) that the shader fetches as a volume.
-      const uint32_t layers = (state.U32(xenos::device::kFetchConstants + 24 * slot + 8) >> 26) + 1;
-      Texture& stack = resolved->second;
-      if (t.dimension == 1 && layers > 1 && stack.width % layers == 0) {
-        if (stack.layers != layers || !stack.volume) {
-          stack.layers = layers;
-          RetireVolume(stack);
-          RefreshVolume(stack);
-        }
-        shared.texture3DIndices[slot] = stack.volume_index;
+  // The same fetch constants as the last draw's (none of the draws since changed them), with no texture
+  // changed since, bind the same.
+  TextureBindings& last = last_textures_;
+  if (!fetch_dirty_ && last.generation == texture_generation_) {
+    std::memcpy(shared.texture2DIndices, last.indices[0], sizeof(shared.texture2DIndices));
+    std::memcpy(shared.texture3DIndices, last.indices[1], sizeof(shared.texture3DIndices));
+    std::memcpy(shared.textureCubeIndices, last.indices[2], sizeof(shared.textureCubeIndices));
+    std::memcpy(shared.samplerIndices, last.indices[3], sizeof(shared.samplerIndices));
+    std::memcpy(shared.texExpScale, last.exp_scale, sizeof(shared.texExpScale));
+    std::memcpy(shared.texBias, last.bias, sizeof(shared.texBias));
+  } else {
+    const uint32_t generation = texture_generation_;
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      // A fetch constant already seen, with no texture changed since.
+      const uint8_t* fetchConstant = state.data + xenos::device::kFetchConstants + 24 * slot;
+      uint32_t words[3];
+      std::memcpy(words, fetchConstant, 12);
+      SlotBinding& binding = bindings_[((words[0] * 2654435761u) ^ (words[1] * 40503u) ^ words[2]) >> 22];
+      if (binding.generation == texture_generation_ && !std::memcmp(binding.fetch, fetchConstant, 24)) {
+        shared.texExpScale[slot] = binding.exp_scale;
+        shared.texBias[slot >> 3] |= binding.bias << ((slot & 7) * 4);
+        shared.texture2DIndices[slot] = binding.texture_2d;
+        shared.texture3DIndices[slot] = binding.texture_3d;
+        shared.textureCubeIndices[slot] = binding.texture_cube;
+        shared.samplerIndices[slot] = binding.sampler;
+        continue;
       }
-    } else if (Texture* texture = GetGuestTexture(t)) {
-      (texture->dimension == 3   ? shared.textureCubeIndices
-       : texture->dimension == 2 ? shared.texture3DIndices
-                                 : shared.texture2DIndices)[slot] = texture->index;
+      binding = SlotBinding{};
+      std::memcpy(binding.fetch, fetchConstant, 24);
+      binding.generation = texture_generation_;
+      binding.exp_scale = shared.texExpScale[slot] = TextureExpScale(state, slot);
+      binding.bias = TextureBiasBits(state, slot);
+      shared.texBias[slot >> 3] |= binding.bias << ((slot & 7) * 4);
+      const xenos::TextureFetch t = xenos::DecodeTextureFetch(state, slot);
+      if (!t.valid) continue;  // the binding stays empty: the same fetch constant is not decoded again
+      // A block resolved at the table's base address is part of the table, not a texture.
+      const bool table = t.format == xenos::kTex_1_5_5_5 && t.width == 2048 && t.mip_address;
+      auto resolved = table ? resolved_.end() : resolved_.find(t.address);
+      if (resolved != resolved_.end() && watcher_ &&
+          watcher_->Dirty(t.address & 0x1FFFFFFF, resolved->second.resolved_size,
+                          resolved->second.watch_stamp)) {
+        // Written by the game since it was resolved: the guest texture now.
+        RetireResolved(resolved->second);
+        RetireResolvedSlots(resolved->second);
+        RetireSpares(t.address & 0xFFFFF000);
+        resolved_.erase(resolved);
+        resolved = resolved_.end();
+        ++texture_generation_;
+        ++stats_["resolved textures overwritten by the game"];
+      }
+      if (resolved != resolved_.end()) {
+        shared.texture2DIndices[slot] = ResolvedIndex(resolved->second, t.swizzle);
+        // A stack of 2D layers (size field bits 26+) that the shader fetches as a volume.
+        const uint32_t layers = (state.U32(xenos::device::kFetchConstants + 24 * slot + 8) >> 26) + 1;
+        Texture& stack = resolved->second;
+        if (t.dimension == 1 && layers > 1 && stack.width % layers == 0) {
+          if (stack.layers != layers || !stack.volume) {
+            stack.layers = layers;
+            RetireVolume(stack);
+            RefreshVolume(stack);
+          }
+          shared.texture3DIndices[slot] = stack.volume_index;
+        }
+      } else if (Texture* texture = GetGuestTexture(t)) {
+        (texture->dimension == 3   ? shared.textureCubeIndices
+         : texture->dimension == 2 ? shared.texture3DIndices
+                                   : shared.texture2DIndices)[slot] = texture->index;
+      }
+      shared.samplerIndices[slot] = GetSampler(t);
+      binding.generation = texture_generation_;  // possibly bumped above
+      binding.texture_2d = shared.texture2DIndices[slot];
+      binding.texture_3d = shared.texture3DIndices[slot];
+      binding.texture_cube = shared.textureCubeIndices[slot];
+      binding.sampler = shared.samplerIndices[slot];
     }
-    shared.samplerIndices[slot] = GetSampler(t);
-    std::memcpy(binding.fetch, fetchConstant, 24);
-    binding.generation = texture_generation_;
-    binding.texture_2d = shared.texture2DIndices[slot];
-    binding.texture_3d = shared.texture3DIndices[slot];
-    binding.texture_cube = shared.textureCubeIndices[slot];
-    binding.sampler = shared.samplerIndices[slot];
+    if (generation == texture_generation_) {
+      std::memcpy(last.indices[0], shared.texture2DIndices, sizeof(last.indices[0]));
+      std::memcpy(last.indices[1], shared.texture3DIndices, sizeof(last.indices[1]));
+      std::memcpy(last.indices[2], shared.textureCubeIndices, sizeof(last.indices[2]));
+      std::memcpy(last.indices[3], shared.samplerIndices, sizeof(last.indices[3]));
+      std::memcpy(last.exp_scale, shared.texExpScale, sizeof(last.exp_scale));
+      std::memcpy(last.bias, shared.texBias, sizeof(last.bias));
+      last.generation = generation;
+      fetch_dirty_ = false;
+    } else {
+      last.generation = 0;
+    }
   }
 
   // Targets.
@@ -2322,118 +2578,140 @@ void Renderer::Draw(const DrawCall& call) {
   SetTargets(color.texture.get(), depth.texture.get(), color1 ? color1->texture.get() : nullptr);
   SetMainLayout();
 
-  // Pipeline.
+  // Pipeline. Draws that agree on what it is built from (shaders, vertex layout, targets and the registers
+  // below) share one: it is found from those values, and only a new combination builds its description.
   const uint32_t depthControl = state.Reg(xenos::reg::RB_DEPTHCONTROL);
   const uint32_t blendControl = state.Reg(xenos::reg::RB_BLENDCONTROL0);
   const uint32_t colorControl = state.Reg(xenos::reg::RB_COLORCONTROL);
-  RenderGraphicsPipelineDesc desc;
-  desc.pipelineLayout = layout_.get();
-  desc.vertexShader = vs->shader.get();
-  desc.pixelShader = ps->shader.get();
-  desc.depthEnabled = (depthControl >> 1) & 1;
-  desc.depthWriteEnabled = (depthControl >> 2) & 1;
-  desc.depthFunction = RenderComparisonFunction(((depthControl >> 4) & 7) + 1);
-  // Stencil (RB_DEPTHCONTROL bit 0; front func/fail/zpass/zfail at 8/11/14/17,
-  // back at 20/23/26/29 when bit 7; RB_STENCILREFMASK ref/mask/writemask).
-  desc.stencilEnabled = depthControl & 1;
-  if (desc.stencilEnabled) {
-    const uint32_t refMask = state.Reg(0x210D);
-    desc.stencilReference = refMask & 0xFF;
-    desc.stencilReadMask = (refMask >> 8) & 0xFF;
-    desc.stencilWriteMask = (refMask >> 16) & 0xFF;
-    desc.stencilFrontFace = StencilFace((depthControl >> 8) & 7, (depthControl >> 11) & 7,
-                                        (depthControl >> 14) & 7, (depthControl >> 17) & 7);
-    desc.stencilBackFace = (depthControl >> 7) & 1
-                               ? StencilFace((depthControl >> 20) & 7, (depthControl >> 23) & 7,
-                                             (depthControl >> 26) & 7, (depthControl >> 29) & 7)
-                               : desc.stencilFrontFace;
-    // The host's front faces are the clockwise ones, the console's are the counter-clockwise ones when
-    // PA_SU_SC_MODE_CNTL bit 2 is clear.
-    if (!(state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4)) std::swap(desc.stencilFrontFace, desc.stencilBackFace);
-  }
-  desc.depthClipEnabled = true;
-  desc.dynamicDepthBiasEnabled = true;
-  desc.primitiveTopology = topology;
-  // PA_SU_SC_MODE_CNTL: cull front, cull back, and the front face (clockwise when
-  // set), all seen through the flipped viewport plume is always clockwise for.
-  const uint32_t cullBits = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 3;
-  const bool frontClockwise = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4;
-  // Rectangle lists are not culled: the corners come in any winding.
-  if (cullBits == 0 || cullBits == 3 || rects) {
-    desc.cullMode = RenderCullMode::NONE;
-  } else {
-    desc.cullMode = (cullBits == 1) == frontClockwise ? RenderCullMode::FRONT : RenderCullMode::BACK;
-  }
-  desc.renderTargetFormat[0] = color.format;
-  desc.renderTargetCount = 1;
-  if (color1) {
-    desc.renderTargetFormat[1] = color1->format;
-    desc.renderTargetCount = 2;
-    desc.renderTargetBlend[1] = RenderBlendDesc::Copy();
-    desc.renderTargetBlend[1].renderTargetWriteMask = uint8_t((colorMaskAll >> 4) & 0xF);
-  }
-  desc.depthTargetFormat = depth.format;
-  RenderBlendDesc& blend = desc.renderTargetBlend[0];
-  blend.srcBlend = BlendFactor(blendControl & 0x1F);
-  blend.blendOp = BlendOp((blendControl >> 5) & 7);
-  blend.dstBlend = BlendFactor((blendControl >> 8) & 0x1F);
-  blend.srcBlendAlpha = BlendFactor((blendControl >> 16) & 0x1F);
-  blend.blendOpAlpha = BlendOp((blendControl >> 21) & 7);
-  blend.dstBlendAlpha = BlendFactor((blendControl >> 24) & 0x1F);
-  blend.blendEnabled = !(blend.srcBlend == RenderBlend::ONE && blend.dstBlend == RenderBlend::ZERO &&
-                         blend.blendOp == RenderBlendOperation::ADD &&
-                         blend.srcBlendAlpha == RenderBlend::ONE && blend.dstBlendAlpha == RenderBlend::ZERO &&
-                         blend.blendOpAlpha == RenderBlendOperation::ADD);
-  blend.renderTargetWriteMask = uint8_t(state.Reg(xenos::reg::RB_COLOR_MASK) & 0xF);
-  uint32_t specConstants = packedNormals ? 1 : 0;  // SPEC_CONSTANT_R11G11B10_NORMAL
-  if (halfNormals) specConstants |= 1 << 5;          // SPEC_CONSTANT_HALF_NORMAL
-  if ((colorControl >> 3) & 1) specConstants |= 2;  // SPEC_CONSTANT_ALPHA_TEST
-  RenderSpecConstant spec(0, specConstants);
-  desc.specConstants = &spec;
-  desc.specConstantsCount = 1;
-  desc.inputSlots = inputSlots.data();
-  desc.inputSlotsCount = uint32_t(inputSlots.size());
-  desc.inputElements = inputElements.data();
-  desc.inputElementsCount = uint32_t(inputElements.size());
-  uint64_t key = XXH3_64bits(&desc, offsetof(RenderGraphicsPipelineDesc, inputSlots));
-  key = XXH3_64bits_withSeed(inputSlots.data(), inputSlots.size() * sizeof(RenderInputSlot), key);
-  for (const RenderInputElement& element : inputElements) {
-    const uint32_t fields[] = {element.location, uint32_t(element.format), element.slotIndex,
-                               element.alignedByteOffset};
-    key = XXH3_64bits_withSeed(fields, sizeof(fields), key);
-  }
-  key = XXH3_64bits_withSeed(&specConstants, 4, key);
-  auto& pipeline = pipelines_[key];
+  const bool depthEnabled = (depthControl >> 1) & 1, depthWriteEnabled = (depthControl >> 2) & 1;
+  const bool stencilEnabled = depthControl & 1;
+  const uint32_t stencilRefMask = stencilEnabled ? state.Reg(0x210D) : 0;
+  const uint32_t colorWriteMask = colorMaskAll & 0xF;
+  const uint32_t inputs[] = {uint32_t(call.vs_key),          uint32_t(call.vs_key >> 32),
+                             uint32_t(call.ps_key),          uint32_t(call.ps_key >> 32),
+                             uint32_t(layoutKey),            uint32_t(layoutKey >> 32),
+                             depthControl,                   blendControl,
+                             (colorControl >> 3) & 1,        stencilRefMask,
+                             state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 7,
+                             uint32_t(color.format),         uint32_t(depth.format),
+                             color1 ? uint32_t(color1->format) : 0, colorMaskAll & 0xFF,
+                             uint32_t(topology) | rects << 8};
+  const uint64_t inputsKey = XXH3_64bits(inputs, sizeof(inputs));
+  RenderPipeline* pipeline = nullptr;
+  if (const auto found = pipeline_inputs_.find(inputsKey); found != pipeline_inputs_.end()) pipeline = found->second;
   if (!pipeline) {
-    const auto start = std::chrono::steady_clock::now();
-    pipeline = device_->createGraphicsPipeline(desc);
-    ++pipelines_created_;
-    ++unsaved_pipelines_;
-    pipeline_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-  }
-  if (!pipeline) {
-    ++stats_["draw skipped: pipeline creation"];
-    static int logged = 0;
-    if (logged++ < 40) {
-      fprintf(stderr, "pipeline failed: vs %016llX ps %016llX elements %zu slots %zu spec %u colorfmt %d\n",
-              (unsigned long long)call.vs_key, (unsigned long long)call.ps_key, inputElements.size(),
-              inputSlots.size(), specConstants, int(desc.renderTargetFormat[0]));
+    RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = layout_.get();
+    desc.vertexShader = vs->shader.get();
+    desc.pixelShader = ps->shader.get();
+    desc.depthEnabled = depthEnabled;
+    desc.depthWriteEnabled = depthWriteEnabled;
+    desc.depthFunction = RenderComparisonFunction(((depthControl >> 4) & 7) + 1);
+    // Stencil (RB_DEPTHCONTROL bit 0; front func/fail/zpass/zfail at 8/11/14/17,
+    // back at 20/23/26/29 when bit 7; RB_STENCILREFMASK ref/mask/writemask).
+    desc.stencilEnabled = stencilEnabled;
+    if (desc.stencilEnabled) {
+      const uint32_t refMask = stencilRefMask;
+      desc.stencilReference = refMask & 0xFF;
+      desc.stencilReadMask = (refMask >> 8) & 0xFF;
+      desc.stencilWriteMask = (refMask >> 16) & 0xFF;
+      desc.stencilFrontFace = StencilFace((depthControl >> 8) & 7, (depthControl >> 11) & 7,
+                                          (depthControl >> 14) & 7, (depthControl >> 17) & 7);
+      desc.stencilBackFace = (depthControl >> 7) & 1
+                                 ? StencilFace((depthControl >> 20) & 7, (depthControl >> 23) & 7,
+                                               (depthControl >> 26) & 7, (depthControl >> 29) & 7)
+                                 : desc.stencilFrontFace;
+      // The host's front faces are the clockwise ones, the console's are the counter-clockwise ones when
+      // PA_SU_SC_MODE_CNTL bit 2 is clear.
+      if (!(state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4)) std::swap(desc.stencilFrontFace, desc.stencilBackFace);
     }
-    return;
+    desc.depthClipEnabled = true;
+    desc.dynamicDepthBiasEnabled = true;
+    desc.primitiveTopology = topology;
+    // PA_SU_SC_MODE_CNTL: cull front, cull back, and the front face (clockwise when
+    // set), all seen through the flipped viewport plume is always clockwise for.
+    const uint32_t cullBits = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 3;
+    const bool frontClockwise = state.Reg(xenos::reg::PA_SU_SC_MODE_CNTL) & 4;
+    // Rectangle lists are not culled: the corners come in any winding.
+    if (cullBits == 0 || cullBits == 3 || rects) {
+      desc.cullMode = RenderCullMode::NONE;
+    } else {
+      desc.cullMode = (cullBits == 1) == frontClockwise ? RenderCullMode::FRONT : RenderCullMode::BACK;
+    }
+    desc.renderTargetFormat[0] = color.format;
+    desc.renderTargetCount = 1;
+    if (color1) {
+      desc.renderTargetFormat[1] = color1->format;
+      desc.renderTargetCount = 2;
+      desc.renderTargetBlend[1] = RenderBlendDesc::Copy();
+      desc.renderTargetBlend[1].renderTargetWriteMask = uint8_t((colorMaskAll >> 4) & 0xF);
+    }
+    desc.depthTargetFormat = depth.format;
+    RenderBlendDesc& blend = desc.renderTargetBlend[0];
+    blend.srcBlend = BlendFactor(blendControl & 0x1F);
+    blend.blendOp = BlendOp((blendControl >> 5) & 7);
+    blend.dstBlend = BlendFactor((blendControl >> 8) & 0x1F);
+    blend.srcBlendAlpha = BlendFactor((blendControl >> 16) & 0x1F);
+    blend.blendOpAlpha = BlendOp((blendControl >> 21) & 7);
+    blend.dstBlendAlpha = BlendFactor((blendControl >> 24) & 0x1F);
+    blend.blendEnabled = !(blend.srcBlend == RenderBlend::ONE && blend.dstBlend == RenderBlend::ZERO &&
+                           blend.blendOp == RenderBlendOperation::ADD &&
+                           blend.srcBlendAlpha == RenderBlend::ONE && blend.dstBlendAlpha == RenderBlend::ZERO &&
+                           blend.blendOpAlpha == RenderBlendOperation::ADD);
+    blend.renderTargetWriteMask = uint8_t(colorWriteMask);
+    uint32_t specConstants = packedNormals ? 1 : 0;  // SPEC_CONSTANT_R11G11B10_NORMAL
+    if (halfNormals) specConstants |= 1 << 5;          // SPEC_CONSTANT_HALF_NORMAL
+    if ((colorControl >> 3) & 1) specConstants |= 2;  // SPEC_CONSTANT_ALPHA_TEST
+    RenderSpecConstant spec(0, specConstants);
+    desc.specConstants = &spec;
+    desc.specConstantsCount = 1;
+    desc.inputSlots = inputSlots.data();
+    desc.inputSlotsCount = uint32_t(inputSlots.size());
+    desc.inputElements = inputElements.data();
+    desc.inputElementsCount = uint32_t(inputElements.size());
+    uint64_t key = XXH3_64bits(&desc, offsetof(RenderGraphicsPipelineDesc, inputSlots));
+    key = XXH3_64bits_withSeed(inputSlots.data(), inputSlots.size() * sizeof(RenderInputSlot), key);
+    for (const RenderInputElement& element : inputElements) {
+      const uint32_t fields[] = {element.location, uint32_t(element.format), element.slotIndex,
+                                 element.alignedByteOffset};
+      key = XXH3_64bits_withSeed(fields, sizeof(fields), key);
+    }
+    key = XXH3_64bits_withSeed(&specConstants, 4, key);
+    auto& created = pipelines_[key];
+    if (!created) {
+      const auto start = std::chrono::steady_clock::now();
+      created = device_->createGraphicsPipeline(desc);
+      ++pipelines_created_;
+      ++unsaved_pipelines_;
+      pipeline_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+    if (!created) {
+      ++stats_["draw skipped: pipeline creation"];
+      static int logged = 0;
+      if (logged++ < 40) {
+        fprintf(stderr, "pipeline failed: vs %016llX ps %016llX elements %zu slots %zu spec %u colorfmt %d\n",
+                (unsigned long long)call.vs_key, (unsigned long long)call.ps_key, inputElements.size(),
+                inputSlots.size(), specConstants, int(desc.renderTargetFormat[0]));
+      }
+      return;
+    }
+    pipeline = created.get();
+    pipeline_inputs_[inputsKey] = pipeline;
   }
 
   // Constants.
   // Draws in a row often share them: keep the upload.
-  const auto uploadConstants = [&](ConstantUpload& last, const uint8_t* source) {
-    if (last.upload != upload_ || std::memcmp(last.source.data(), source, 4096)) {
-      last.offset = Allocate(nullptr, 4096);
+  const auto uploadConstants = [&](ConstantUpload& last, const uint8_t* source, uint32_t count) {
+    const uint32_t bytes = count * 16;
+    if (last.upload != upload_ || last.bytes < bytes || last.dirty_begin < std::min(last.dirty_end, count)) {
+      last.offset = Allocate(source, bytes, 16);
       last.upload = upload_;
-      std::memcpy(last.source.data(), source, 4096);
-      CopySwapped32(upload_memory_ + last.offset, source, 4096);
+      last.bytes = bytes;
+      last.dirty_begin = last.dirty_end = 0;
     }
     return last.offset;
   };
-  const bool worldDraw = color.scale_x > color.scale && desc.depthEnabled &&
+  const bool worldDraw = color.scale_x > color.scale && depthEnabled &&
                          std::find(std::begin(kInterfaceVertexShaders), std::end(kInterfaceVertexShaders),
                                    call.vs_key) == std::end(kInterfaceVertexShaders);
   // The interface keeps its 16:9 shape, in the middle of a wider picture.
@@ -2455,8 +2733,8 @@ void Renderer::Draw(const DrawCall& call) {
   }
   const float xScale = interfaceDraw ? color.scale : color.scale_x;
   const float scaleXy = color.scale;
-  const uint64_t vsConstants = uploadConstants(vs_constants_, state.data + xenos::device::kVertexConstants);
-  const uint64_t psConstants = uploadConstants(ps_constants_, state.data + xenos::device::kPixelConstants);
+  const uint64_t vsConstants = uploadConstants(vs_constants_, state.data + xenos::device::kVertexConstants, call.vs_constants);
+  const uint64_t psConstants = uploadConstants(ps_constants_, state.data + xenos::device::kPixelConstants, call.ps_constants);
   shared.booleans = (state.U32(xenos::device::kVertexBoolConstants) & 0xFF) |
                     ((state.U32(xenos::device::kPixelBoolConstants) & 0xFF) << 16);
   shared.alphaThreshold = state.RegF(xenos::reg::RB_ALPHA_REF);
@@ -2494,8 +2772,8 @@ void Renderer::Draw(const DrawCall& call) {
   const uint64_t pushConstants[] = {upload_address_ + vsConstants, upload_address_ + psConstants,
                                     upload_address_ + sharedConstants};
 
-  TrackEdram(state, color, depth, blend.renderTargetWriteMask != 0,
-             desc.depthWriteEnabled || (desc.stencilEnabled && desc.stencilWriteMask), ViewportBottom(state),
+  TrackEdram(state, color, depth, colorWriteMask != 0,
+             depthWriteEnabled || (stencilEnabled && ((stencilRefMask >> 16) & 0xFF)), ViewportBottom(state),
              true);
 
   // Viewport from the D3D viewport transform (the shaders invert Y).
@@ -2505,11 +2783,12 @@ void Renderer::Draw(const DrawCall& call) {
   float xOffset = 0.0f;
   if (interfaceDraw && color.scale_x > color.scale) {
     const float spare = (color.scale_x - color.scale) * float(color.width / color.scale_x);
-    const uint8_t* transform = state.data + xenos::device::kVertexConstants + 4 * 16;
-    float screenX = xenos::LoadBEFloat(transform + 12);
+    float transform[4];  // c4, in host order
+    std::memcpy(transform, state.data + xenos::device::kVertexConstants + 4 * 16, sizeof(transform));
+    float screenX = transform[3];
     if (call.inline_vertices && call.inline_size >= 8) {
-      screenX += xenos::LoadBEFloat(transform) * xenos::LoadBEFloat(call.inline_vertices) +
-                 xenos::LoadBEFloat(transform + 4) * xenos::LoadBEFloat(call.inline_vertices + 4);
+      screenX += transform[0] * xenos::LoadBEFloat(call.inline_vertices) +
+                 transform[1] * xenos::LoadBEFloat(call.inline_vertices + 4);
     }
     constexpr uint32_t kWorldFrame = 50;
     const bool world = world_draws_last_frame_ >= kWorldFrame && !interface_cover_;
@@ -2546,9 +2825,9 @@ void Renderer::Draw(const DrawCall& call) {
     has_bound_viewport_ = true;
   }
 
-  if (bound_pipeline_ != pipeline.get()) {
-    commands_->setPipeline(pipeline.get());
-    bound_pipeline_ = pipeline.get();
+  if (bound_pipeline_ != pipeline) {
+    commands_->setPipeline(pipeline);
+    bound_pipeline_ = pipeline;
   }
   // Polygon offset, or coplanar layers (decals, ground) fight in the distance.
   // Enabled per face; the game sets both alike. The offset is in depth units,
@@ -2564,7 +2843,7 @@ void Renderer::Draw(const DrawCall& call) {
       std::memcpy(bound_bias_, bias, sizeof(bias));
     }
     has_bound_bias_ = true;
-    ++stats_["draws with polygon offset"];
+    ++polygon_offset_draws_;
   } else if (!has_bound_bias_ || bound_bias_[0] != 0.0f || bound_bias_[1] != 0.0f) {
     commands_->setDepthBias(0.0f, 0.0f, 0.0f);
     bound_bias_[0] = bound_bias_[1] = 0.0f;
@@ -2615,7 +2894,7 @@ void Renderer::Draw(const DrawCall& call) {
   } else {
     commands_->drawInstanced(call.count, 1, call.start, 0);
   }
-  ++stats_["draws"];
+  ++draws_;
   if (call.export_count) {
     // The draws after this one fetch the textures again.
     ++texture_generation_;

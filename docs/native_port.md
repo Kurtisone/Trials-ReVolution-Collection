@@ -340,8 +340,9 @@ Where it went:
    as in the frame before. The conversion is one loop per format now, with a table for the page table's half floats (9.8 to
    5.2 ms), and rows that are the same as last time are left alone (to 3.2 ms), unless nothing is known of the memory:
    a write by the game since (`WriteWatcher`), or a rect written before this one over the same tiles (rects overlap: the
-   page table's levels are resolved into one another's memory, and the last one in order has to win). In a run with every
-   skipped row checked, none was wrong after the first seconds. The buffers are kept, not created and freed for each rect.
+   page table's levels are resolved into one another's memory, and the last one in order has to win). A check of every
+   skipped row, rect by rect, found none wrong after the first seconds; a check of the memory after the whole pass
+   found the skipping not exact, see "Riding and the second track". The buffers are kept, not created and freed for each rect.
 2. Two scratch addresses were resolved at five sizes and formats in turn (the post processing chain, the table's smallest
    levels), and a texture was created for each every frame, 0.25 ms apiece. Each size keeps its texture now (1.9 ms).
 3. Draws uploaded 8 KB of constants each, byte swapped twice. Only the registers a shader's ALU instructions read are
@@ -356,6 +357,44 @@ and 66 to 80 FPS without it.
 What stays: the read back (3 ms: the compare and the scatter into the tiled layout, which only the GPU packing the table to
 2 bytes a texel would cut), recording the draws (RADV's share is about 2 ms), the present copy (a GPU side present through
 the swapchain would save it), the GPU at 9 ms. Xvfb has no DRI3, so what presenting costs on a real display is not shown here.
+
+### Riding and the second track
+
+`nav.py` with `NAV_RIDE=1` rides: `keyd` (XTest, keys held) keeps the throttle down, leans a and d at random, presses B every
+25 s and Back (restart track) every 70 s; `NAV_SELECT_KEYS="d"` picks the next track (Training Program 2, unlocked by
+finishing the first, which a ride does after about 100 s), `NAV_LIMIT=60` sets the frame limit. `ride.sh <tag> <secs> [limit]
+[keys]` runs it and `ridestats.py` gives the numbers: the 5 s windows of the stats line, so minimum and worst are of 5 s
+averages. Pictures: snapshots every 50 s.
+
+| Greenhorn's Grove, ridden | FPS min / median / max | Renderer thread ms | GPU ms |
+| --- | --- | --- | --- |
+| No limit, 4 min | 52 / 60 / 70 | 11.4 / 13.4 / 15.8 | 9 to 11.5 |
+| `native_gpu_frame_limit = 60`, 2.5 min | 50 / 59.0 / 60.2 | 10.5 / 12.0 / 15.1 | 9 to 11.2 |
+
+The slow windows come with the checkpoint and track restarts (one frame takes 70 to 80 ms, once every 25 s). Single frames in the 300 frame line: 15 to 30 ms, apart from the restarts. The
+renderer thread stays under 16.6 ms except in windows with a restart, so the limit holds 60 most of the time, not always.
+
+The second track (limit 60, 2 min): FPS 58.4 / 59.9 / 60.1, renderer thread 10.5 / 12.1 / 14.0 ms, no shader missing. Pictures of both tracks, ridden: no
+black holes, missing decals or flicker seen; the rider, sky, decals, signs, shadows and the finish screen are right. Not
+compared with the emulated renderer on the second track: the emulated runs crash at the start there (slower game), so
+no frame of the same moment exists.
+
+Shaders: 16 hashes were "not in the cache" (4 at the first track's loading, 12 in the second track); all dumped with
+`gpu_shader_dump_dir` from emulated runs (`out/shader_dump`, 119 files now), `tools/native/build_shaders.sh`, rebuilt: none
+left on the first track or at the start of the second. Two more (`885C7E9950FFF792`, `D646D1067FE1707E`) showed once, 87 s
+into a ride of the second track, in a memory export draw next to the page table's; no run since has reached them again
+(3 more of 200 to 400 s, emulated and native with the dump on), so they are not in the cache.
+
+Read back skipping, exactness. The skipping is not exact: converting every rect again after a pass and comparing the
+memory (a temporary check, `out/native_tools/verify_read_back.py`) found about 1 rect in 1,000 different (100 of 100,000
+in a 40 s ride), through the whole ride, not only at the start. The rects that differ are mostly the page table's levels and
+scratch pairs, which share memory. An exact version
+is `out/native_tools/exact_read_back.patch`: the memory is owned by the rect that wrote it last (`memory_owner_`, per KB),
+and a row is left alone only while its rect owns all of it, or a later entry of the same pass covers it. Checked as above:
+0 of 100,000 differ. It costs the gain: read back 3.3 ms at first, and about 7 ms in most rides from the first restart on (a
+state in which the 25 rects of the post processing chain, the page table's levels and scratch pairs are all converted every
+frame; the ownership never settles in it, and why was not found), so the renderer thread goes to 15.8 ms and the limit
+holds 58 FPS. **Not applied**: no wrong picture was seen with the inexact skipping, and 3 ms is the margin the limit needs.
 
 ## Verdict so far
 
